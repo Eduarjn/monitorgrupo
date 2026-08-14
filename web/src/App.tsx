@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import {
-  BarChart3, LogOut, MessageSquareText, Search, ShieldCheck, UploadCloud,
+  BarChart3, LogOut, MessageSquareText, Plug, Search, ShieldCheck, UploadCloud,
 } from 'lucide-react';
 import { api, type Grupo } from './lib/api.ts';
 import { useSessao } from './lib/auth.tsx';
@@ -10,13 +10,15 @@ import Dashboard from './paginas/Dashboard.tsx';
 import Upload from './paginas/Upload.tsx';
 import Analise from './paginas/Analise.tsx';
 import Consentimento from './paginas/Consentimento.tsx';
+import Coleta from './paginas/Coleta.tsx';
 
-type Aba = 'dashboard' | 'analise' | 'upload' | 'lgpd';
+type Aba = 'dashboard' | 'analise' | 'upload' | 'coleta' | 'lgpd';
 
 const ABAS: Array<{ id: Aba; rotulo: string; Icone: typeof BarChart3 }> = [
   { id: 'dashboard', rotulo: 'Dashboard', Icone: BarChart3 },
   { id: 'analise', rotulo: 'Resumo e busca', Icone: Search },
   { id: 'upload', rotulo: 'Upload', Icone: UploadCloud },
+  { id: 'coleta', rotulo: 'Coleta', Icone: Plug },
   { id: 'lgpd', rotulo: 'Consentimento', Icone: ShieldCheck },
 ];
 
@@ -117,7 +119,15 @@ export default function App() {
           </Aviso>
         )}
 
-        {grupo && (
+        {/* Coleta é dado de CONTA, não de grupo: o canal de aviso é um só e o
+            painel de saúde cobre todos os grupos. Por isso fica fora do
+            `grupo &&` — senão a tela ficaria em branco sem grupo selecionado. */}
+        {aba === 'coleta' && (
+          <Coleta grupo={grupo?.id ?? 0} podeGerir={podeGerir}
+                  ehAdmin={usuario.papel_global === 'admin'} />
+        )}
+
+        {grupo && aba !== 'coleta' && (
           <>
             {aba === 'dashboard' && <Dashboard grupo={grupo.id} />}
             {aba === 'analise' && <Analise grupo={grupo.id} />}

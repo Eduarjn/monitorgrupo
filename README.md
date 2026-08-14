@@ -54,17 +54,38 @@ para ativar os modelos de verdade.
 ## Build da API
 
 ```bash
-npx esbuild api/server.ts --bundle --platform=node --format=esm --outfile=dist/server.mjs
+npx esbuild api/server.ts --bundle --platform=node --format=esm --external:pg --outfile=dist/server.mjs
 ```
 
 O Node do servidor é v20 e não executa TypeScript direto — daí o bundle.
+
+⚠️ **`--external:pg` não é opcional.** O `pg` é CommonJS e usa `require()`
+dinâmico; empacotado dentro de um bundle ESM, o processo morre no boot com
+*"Dynamic require of 'events' is not supported"*. O `pg` já está instalado em
+`node_modules` no servidor. Este README já derrubou o serviço uma vez por omitir
+essa flag (D7).
 
 ## Variáveis de ambiente da API
 
 | Variável | Para quê |
 |---|---|
 | `JWT_SECRET` | mesmo segredo do PostgREST; assina o token que o RLS lê |
-| `DATABASE_URL` | conexão com o banco `whatsapp_monitor` |
+| `PGURL` | conexão com o banco `whatsapp_monitor` |
 | `ORIGENS_PERMITIDAS` | lista branca de CORS, separada por vírgula |
+| `CONEXAO_CHAVE_V1` | 32 bytes em base64 — cifra o token do canal de aviso |
+| `CONEXAO_CHAVE_ATIVA` | qual versão cifra os segredos novos (padrão `1`) |
 | `OPENAI_API_KEY` | opcional; sem ela o provider é o mock |
+| `LEMBRETES` | `off` desliga a rotina de cobrança da coleta |
 | `PORTA` | padrão 3020 |
+
+Gerar a chave de criptografia:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+Ela vive **só** no `EnvironmentFile` do systemd, em modo 0600. Guardá-la no banco
+tornaria a cifra inútil: quem lê a tabela leria a chave junto.
+
+O restante da configuração — endereço da API do canal, token, template, cadência
+e destino do lembrete — é cadastrado **pela interface**, na aba Coleta.

@@ -29,6 +29,12 @@ export interface UsuarioSessao {
   id: string;
   email: string;
   nome: string | null;
+  /**
+   * Só informativo, para a interface decidir o que mostrar. A autorização de
+   * verdade (`exigirAdmin`) relê do banco a cada chamada — papel dentro de um
+   * JWT de 12h continuaria valendo depois de ser revogado.
+   */
+  papel_global?: 'usuario' | 'admin';
 }
 
 // ------------------------------------------------------------------- senha
@@ -99,6 +105,17 @@ export async function garantirTabelaUsuarios(db: DB): Promise<void> {
       criado_em  timestamptz not null default now(),
       ultimo_acesso timestamptz
     )`);
+  // Autorização de CONTA (não de grupo). `grupo_acessos` resolve quem lê qual
+  // grupo, mas o canal de aviso é um só para o painel inteiro: sem este papel,
+  // gestor de um grupo qualquer poderia trocar o token do WhatsApp da ERA.
+  await db.query(
+    `alter table usuarios add column if not exists papel_global text not null default 'usuario'`,
+  );
+  await db.query(`
+    do $$ begin
+      alter table usuarios add constraint usuarios_papel_global_check
+        check (papel_global in ('usuario','admin'));
+    exception when duplicate_object then null; end $$`);
   // Sem GRANT para anon/authenticated: a tabela de senhas NUNCA é exposta pelo
   // PostgREST. Só o backend (service_role) a enxerga.
   await db.query(`revoke all on usuarios from anon, authenticated`).catch(() => {});
@@ -122,7 +139,7 @@ export async function autenticar(
   db: DB, email: string, senha: string,
 ): Promise<UsuarioSessao | null> {
   const { rows } = await db.query<UsuarioSessao & { senha_hash: string; ativo: boolean }>(
-    `select id, email, nome, senha_hash, ativo from usuarios where email = lower($1)`,
+    `select id, email, nome, papel_global, senha_hash, ativo from usuarios where email = lower($1)`,
     [email],
   );
   const u = rows[0];
@@ -136,5 +153,5 @@ export async function autenticar(
   if (!(await conferirSenha(senha, u.senha_hash))) return null;
 
   await db.query(`update usuarios set ultimo_acesso = now() where id = $1`, [u.id]);
-  return { id: u.id, email: u.email, nome: u.nome };
+  return { id: u.id, email: u.email, nome: u.nome, papel_global: u.papel_global ?? 'usuario' };
 }

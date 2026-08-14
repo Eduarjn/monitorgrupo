@@ -39,7 +39,11 @@ async function req<T>(caminho: string, opcoes: RequestInit = {}): Promise<T> {
 
 // ------------------------------------------------------------------- tipos
 
-export interface Usuario { id: string; email: string; nome: string | null }
+export interface Usuario {
+  id: string; email: string; nome: string | null;
+  /** Só decide o que a interface mostra; a autorização real é refeita na API. */
+  papel_global?: 'usuario' | 'admin';
+}
 export interface Grupo {
   id: number; nome: string; descricao: string | null;
   frequencia_coleta: string; ultima_coleta_em: string | null;
@@ -68,6 +72,24 @@ export interface Busca {
 export interface Consentimento {
   id: number; versao_texto: string; texto: string; base_legal: string;
   canal: string | null; consentido_em: string; revogado_em: string | null; pessoa: string | null;
+}
+export interface SaudeColeta {
+  grupo_id: number; nome: string;
+  frequencia_coleta: 'diaria' | 'semanal' | 'manual';
+  ultima_coleta_em: string | null; proxima_coleta_em: string | null;
+  dias_sem_coleta: number | null; atrasado: boolean; nunca_coletado: boolean;
+  lembrete_ativo: boolean; lembrete_destino: string | null; lembrete_enviado_em: string | null;
+  consentimento_ok: boolean; mensagens: number;
+}
+/** `tem_token` no lugar do token: o segredo nunca sai da API, nem mascarado. */
+export interface Conexao {
+  id: number; rotulo: string; provedor: string;
+  endpoint: string | null; remetente: string | null;
+  config: { template?: string; idioma?: string };
+  status: 'desconectado' | 'conectado' | 'erro';
+  erro_mensagem: string | null; erro_em: string | null;
+  ultima_verificacao_em: string | null; ultimo_uso_em: string | null;
+  tem_token: boolean; criado_em: string; atualizado_em: string;
 }
 
 // ------------------------------------------------------------------- rotas
@@ -118,4 +140,40 @@ export const api = {
     req<{ consentimento: { id: number; consentido_em: string } }>('/consentimentos', {
       method: 'POST', body: JSON.stringify({ grupo_id: grupo, ...dados }),
     }),
+
+  revogarConsentimento: (grupo: number, id: number) =>
+    req<{ consentimento: { id: number; revogado_em: string }; consentimento_vigente: boolean }>(
+      '/consentimentos/revogar', { method: 'POST', body: JSON.stringify({ grupo_id: grupo, id }) }),
+
+  // ---- coleta assistida --------------------------------------------------
+  saudeColeta: () => req<{ grupos: SaudeColeta[] }>('/coleta/saude'),
+
+  salvarColeta: (grupo: number, dados: {
+    frequencia_coleta: string; lembrete_ativo: boolean; lembrete_destino?: string | null;
+  }) => req<{ grupo: SaudeColeta }>('/coleta/config', {
+    method: 'POST', body: JSON.stringify({ grupo_id: grupo, ...dados }),
+  }),
+
+  enviarLembrete: (grupo: number, destino?: string) =>
+    req<{ enviado: boolean; destino: string }>('/coleta/lembrete', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, destino }),
+    }),
+
+  lembretes: (grupo: number) =>
+    req<{ lembretes: Array<{ id: number; destino: string; status: string; erro: string | null; criado_em: string }> }>(
+      '/coleta/lembretes' + qs({ grupo_id: grupo })),
+
+  // ---- canal de aviso (admin do painel) ----------------------------------
+  conexoes: () => req<{ conexoes: Conexao[] }>('/conexoes'),
+
+  salvarConexao: (dados: {
+    id?: number; rotulo: string; endpoint: string; remetente?: string;
+    template?: string; idioma?: string; token?: string;
+  }) => req<{ conexao: Conexao }>('/conexoes', { method: 'POST', body: JSON.stringify(dados) }),
+
+  testarConexao: (id: number) =>
+    req<{ ok: boolean; status: string }>('/conexoes/testar' + qs({ id }), { method: 'POST' }),
+
+  removerConexao: (id: number) =>
+    req<{ conexao: Conexao }>('/conexoes/remover' + qs({ id }), { method: 'POST' }),
 };

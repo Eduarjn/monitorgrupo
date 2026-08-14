@@ -329,6 +329,83 @@ Sobre o DNS pendente da Fase 6: `wa-api.sobreip.com.br` resolve para
 **189.113.38.45** (não é o servidor). Irrelevante na prática — a API já é servida
 em `erareason.sobreip.com.br/wa-api`, que é o que o `.env.production` usa.
 
+## D7 — Conexão por QR Code: não existe. Coleta assistida no lugar (14/08/2026)
+
+O Eduardo pediu vincular o número por QR Code, para substituir o upload manual.
+**Reverificado hoje contra a documentação primária da Meta, com três agentes
+adversariais tentando derrubar a conclusão. Nenhum conseguiu.**
+
+| Caminho oficial | Serve? |
+|---|---|
+| **Groups API** (GA em 16/06/2026) | Não. Só grupos que a própria empresa cria, teto de 8 participantes. Não há endpoint para entrar em grupo de terceiros nem para ler o passado. `POST /{group_id}/join_requests` engana pelo nome: é a empresa **aprovando** quem pede para entrar no grupo dela |
+| **Coexistence** (webhook `history`) | Não. Sincroniza 180 dias, mas exclui grupos por texto expresso: *"Group chats will not be synchronized."* |
+| **Cloud API** (webhooks) | Parcial. Conversa 1:1 em tempo real, nunca grupo |
+
+**Razão de fundo:** o WhatsApp é E2EE. A Meta não tem o conteúdo no servidor — o
+histórico existe só no aparelho e no backup. Não é política que mude num
+changelog; é ausência do dado. Por isso o "Exportar conversa" continua sendo um
+clique no celular.
+
+**Correção de algo que circulava aqui:** *não existe QR Code oficial no fluxo de
+Coexistence*. O fluxo real é código de verificação numérico dentro do app. O "QR"
+de blogs de BSPs é interface deles.
+
+**O QR que funciona é o proibido.** Whapi.Cloud, Maytapi, Periskope, Unipile e
+Wassenger entregam monitoramento de grupo — e todos, checados na fonte primária,
+conectam por leitura de QR (WhatsApp Web / linked device). A Unipile declara não
+ter afiliação com a Meta; a Wassenger diz "parceiro oficial" e manda ler QR na
+home. Isso **confirma** a D2 em vez de enfraquecê-la. Mantida a recusa do brief.
+
+Detalhe que fecha o argumento: mesmo aceitando o risco de ban, **não resolveria o
+histórico** — `fetchMessageHistory` do Baileys falha e desligar `syncFullHistory`
+quebra o sync de grupos. O retroativo continuaria vindo do `.txt`.
+
+### O que foi construído: Opção A — coleta assistida
+
+Achado que reorientou a decisão: **a ERA já tem WhatsApp oficial** — o Omnichannel
+Calliope, com API de template HSM em produção. O lembrete sai por ele, hoje, sem
+Tech Provider, sem App Review e sem mexer no número comercial. (E se o número já
+estiver na WABA do Calliope, o Embedded Signup nem seria executável sem migração
+entre WABAs — pendente de confirmação.)
+
+Entregue e no ar:
+
+- `db/2026-08-coleta.sql` — `consentimento_vigente()`, `usuarios.papel_global`,
+  `conexoes`, `conexao_eventos`, `lembretes_enviados`, colunas de lembrete em `grupos`.
+- `api/conexao/cripto.ts` — AES-256-GCM versionado + `sanitizar()` de logs.
+- `api/conexao/calliope.ts` — disparo de template e teste de canal.
+- `api/coleta/queries.ts` — saúde da coleta e fila de cobrança, em SQL puro.
+- Aba **Coleta** no painel: saúde de todos os grupos, cadência e destino por grupo,
+  e cadastro do canal (endpoint, token, template) **pela interface**, não por env.
+- Rotina de cobrança **dentro do processo** (de hora em hora). Um systemd timer
+  exigiria credencial em disco ou rota sem autenticação — as duas pioram a segurança.
+
+**O gate de consentimento deixou de ser decorativo.** Antes, nenhum ponto da
+ingestão consultava a tabela e `revogado_em` não tinha caminho de escrita. Agora:
+ligar o lembrete ou disparar manualmente sem aviso vigente devolve **409**; o
+upload **avisa e não bloqueia** (ato humano deliberado, diferente do que roda
+sozinho). Rota `/consentimentos/revogar` criada.
+
+**Provado na API real:** 409 ao ligar cobrança sem consentimento; 409 no disparo
+manual; 400 em telefone inválido; 200 com o lembrete desligado. 41/41 testes
+unitários (13 novos: rotação de chave, chave errada falha em vez de devolver
+lixo, adulteração detectada pela tag do GCM, sanitização de segredo em log).
+
+⚠️ **Dois erros encontrados durante a implantação:**
+
+1. **O comando de build do README derrubou o serviço.** `esbuild --bundle` sem
+   `--external:pg` empacota o `pg`, que é CommonJS, e o processo morre com
+   *"Dynamic require of events is not supported"*. Restaurado do backup em
+   segundos; README corrigido. **Sempre `--external:pg`.**
+2. **`bigint` volta como string do driver do Postgres.** `grupo_id` chegava como
+   `"1"` e a comparação com o id numérico do seletor (`Number(...)`) falhava em
+   silêncio — a tela ficaria vazia ao trocar de grupo. Corrigido com `::int` nas
+   queries de `/grupos` e `/coleta/saude`. Bug latente que já existia.
+
+**Pendente de você:** cadastrar o token do Calliope na aba Coleta e confirmar o
+nome do template aprovado na Meta (o padrão é `lembrete_coleta`, com duas
+variáveis: nome do grupo e há quanto tempo sem coleta).
+
 ## Pendentes de decisão
 
 - **Export real para os fixtures** (Fase 0): valida o parser contra a realidade.

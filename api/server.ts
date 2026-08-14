@@ -25,6 +25,11 @@ import { resumirDiaComCache } from './ai/summarize.ts';
 import { perguntar } from './ai/search.ts';
 import { parseTexto } from './ingestion/parser.ts';
 import { hashArquivo } from './ingestion/dedup.ts';
+import { abrir, sanitizar, selar } from './conexao/cripto.ts';
+import { enviarTemplate, testarConexao, variaveisDoLembrete,
+         type ConfigCalliope } from './conexao/calliope.ts';
+import { getGruposParaLembrar, getSaudeColeta, normalizarDestino,
+         proximaColeta, type FrequenciaColeta } from './coleta/queries.ts';
 
 const PORTA = Number(process.env.PORTA ?? 3020);
 const SEGREDO = process.env.JWT_SECRET ?? '';
@@ -93,6 +98,80 @@ async function exigirAcesso(usuario: UsuarioSessao, grupoId: number, gerir = fal
   return papel;
 }
 
+/**
+ * Autorização de CONTA, não de grupo. O canal de aviso é um só para o painel
+ * inteiro: sem isto, quem tem acesso de gestor a um grupo qualquer poderia
+ * trocar o token do WhatsApp comercial da ERA.
+ */
+async function exigirAdmin(usuario: UsuarioSessao) {
+  const { rows } = await db.query<{ papel_global: string }>(
+    `select papel_global from usuarios where id = $1`, [usuario.id],
+  );
+  if (rows[0]?.papel_global !== 'admin') {
+    throw new ErroHttp(403, 'Só um administrador do painel pode alterar o canal de aviso.');
+  }
+}
+
+/**
+ * Gate da LGPD (D7): coleta automática exige aviso registrado e não revogado.
+ * Consulta a função do banco para que a regra viva num lugar só.
+ */
+async function consentimentoVigente(grupoId: number): Promise<boolean> {
+  const { rows } = await db.query<{ ok: boolean }>(
+    `select consentimento_vigente($1) as ok`, [grupoId],
+  );
+  return rows[0]?.ok === true;
+}
+
+/** Só as colunas seguras. O token cifrado nunca sai daqui — nem mascarado. */
+const COLUNAS_CONEXAO = `id, rotulo, provedor, endpoint, remetente, config, status,
+  erro_codigo, erro_mensagem, erro_em, ultima_verificacao_em, ultimo_uso_em,
+  (token_cifrado is not null) as tem_token, criado_em, atualizado_em`;
+
+async function conexaoAtiva(): Promise<{ id: number; cfg: ConfigCalliope } | null> {
+  const { rows } = await db.query<{
+    id: number; endpoint: string; remetente: string | null; config: Record<string, unknown>;
+    token_cifrado: Buffer | null; token_iv: Buffer | null; token_tag: Buffer | null; token_versao: number;
+  }>(`select id, endpoint, remetente, config, token_cifrado, token_iv, token_tag, token_versao
+        from conexoes where status = 'conectado' and token_cifrado is not null
+       order by atualizado_em desc limit 1`);
+  const c = rows[0];
+  if (!c?.token_cifrado || !c.token_iv || !c.token_tag || !c.endpoint) return null;
+  return {
+    id: c.id,
+    cfg: {
+      endpoint: c.endpoint,
+      token: abrir({ cifrado: c.token_cifrado, iv: c.token_iv, tag: c.token_tag, versao: c.token_versao }),
+      remetente: c.remetente ?? undefined,
+      template: String(c.config?.template ?? 'lembrete_coleta'),
+      idioma: String(c.config?.idioma ?? 'pt_BR'),
+    },
+  };
+}
+
+/** Dispara o lembrete de um grupo e registra o resultado. Nunca lança. */
+async function dispararLembrete(
+  grupo: { grupo_id: number; nome: string; destino: string; dias_sem_coleta: number | null },
+): Promise<{ ok: boolean; erro?: string }> {
+  const conexao = await conexaoAtiva();
+  if (!conexao) return { ok: false, erro: 'Nenhum canal de aviso conectado.' };
+
+  const r = await enviarTemplate(
+    conexao.cfg, grupo.destino, variaveisDoLembrete(grupo.nome, grupo.dias_sem_coleta),
+  );
+  await db.query(
+    `insert into lembretes_enviados (grupo_id, conexao_id, destino, status, erro, detalhe)
+     values ($1,$2,$3,$4,$5,$6)`,
+    [grupo.grupo_id, conexao.id, grupo.destino, r.ok ? 'enviado' : 'erro',
+     r.erro ?? null, JSON.stringify(r.detalhe ?? {})],
+  );
+  if (r.ok) {
+    await db.query(`update grupos set lembrete_enviado_em = now() where id = $1`, [grupo.grupo_id]);
+    await db.query(`update conexoes set ultimo_uso_em = now() where id = $1`, [conexao.id]);
+  }
+  return { ok: r.ok, erro: r.erro };
+}
+
 const num = (v: string | null, padrao?: number) => {
   const n = Number(v);
   if (!Number.isFinite(n)) {
@@ -121,12 +200,20 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
 
   const usuario = usuarioDaRequisicao(req);   // daqui para baixo, tudo autenticado
 
-  if (rota === '/auth/eu') return { usuario };
+  if (rota === '/auth/eu') {
+    // O papel vem do banco, não do token: revogar admin precisa valer na hora,
+    // não só depois que o JWT de 12h vencer.
+    const { rows } = await db.query<{ papel_global: string }>(
+      `select papel_global from usuarios where id = $1`, [usuario.id]);
+    return { usuario: { ...usuario, papel_global: rows[0]?.papel_global ?? 'usuario' } };
+  }
 
   // ---- grupos -------------------------------------------------------------
   if (rota === '/grupos') {
     const { rows } = await db.query(
-      `select g.id, g.nome, g.descricao, g.frequencia_coleta, g.ultima_coleta_em, a.papel,
+      // ::int — o driver devolve bigint como string; sem o cast, trocar de
+      // grupo no seletor (que converte para número) não casa com nada.
+      `select g.id::int as id, g.nome, g.descricao, g.frequencia_coleta, g.ultima_coleta_em, a.papel,
               (select count(*) from mensagens m where m.grupo_id = g.id)::int as mensagens
          from grupos g
          join grupo_acessos a on a.grupo_id = g.id and a.user_id = $1
@@ -221,7 +308,14 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
                           processado_em=now() where id=$1`,
       [up.id, novas, repetidas],
     );
-    await db.query(`update grupos set ultima_coleta_em = now() where id = $1`, [g]);
+    // Reagenda a próxima coleta a partir de AGORA. Antes desta fase nada nunca
+    // escrevia em `proxima_coleta_em`, então nenhum grupo ficava "atrasado" e o
+    // painel de saúde não tinha régua.
+    const { rows: [freq] } = await db.query<{ frequencia_coleta: FrequenciaColeta }>(
+      `update grupos set ultima_coleta_em = now() where id = $1 returning frequencia_coleta`, [g]);
+    const prox = proximaColeta(freq?.frequencia_coleta ?? 'semanal', new Date());
+    await db.query(`update grupos set proxima_coleta_em = $2 where id = $1`,
+                   [g, prox?.toISOString() ?? null]);
 
     return {
       duplicado: false, upload_id: up.id,
@@ -233,6 +327,10 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
       linhas_lidas: meta.linhasLidas,
       mensagens_lidas: mensagens.length,
       mensagens_novas: novas, mensagens_repetidas: repetidas,
+      proxima_coleta_em: prox?.toISOString() ?? null,
+      // Upload é ato humano e deliberado: avisa, não bloqueia. O bloqueio vale
+      // para o que roda sozinho (lembrete automático). Ver D7.
+      sem_consentimento: !(await consentimentoVigente(g)),
     };
   }
 
@@ -300,6 +398,232 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     return { consentimento: rows[0] };
   }
 
+  if (rota === '/consentimentos/revogar' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    const id = num(String(corpo.id));
+    // Revogação é por registro, não por grupo: o aviso continua no histórico
+    // com a data em que deixou de valer — apagar seria destruir a prova.
+    const { rows } = await db.query(
+      `update consentimentos set revogado_em = now()
+        where id = $1 and grupo_id = $2 and revogado_em is null
+        returning id, revogado_em`, [id, g]);
+    if (!rows[0]) throw new ErroHttp(404, 'Aviso não encontrado ou já revogado.');
+    return { consentimento: rows[0], consentimento_vigente: await consentimentoVigente(g) };
+  }
+
+  // ---- coleta assistida (Opção A / D7) -----------------------------------
+  if (rota === '/coleta/saude') {
+    return { grupos: await getSaudeColeta(db, usuario.id) };
+  }
+
+  if (rota === '/coleta/config' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+
+    const freq = String(corpo.frequencia_coleta ?? 'semanal') as FrequenciaColeta;
+    if (!['diaria', 'semanal', 'manual'].includes(freq)) {
+      throw new ErroHttp(400, 'Frequência inválida.');
+    }
+    const ativo = corpo.lembrete_ativo === true;
+
+    let destino: string | null = null;
+    if (corpo.lembrete_destino) {
+      destino = normalizarDestino(String(corpo.lembrete_destino));
+      if (!destino) throw new ErroHttp(400, 'Telefone inválido. Use DDD + número, ex.: 19 93501-0887.');
+    }
+    // Ligar a cobrança sem destino deixaria a rotina silenciosamente inerte.
+    if (ativo && !destino) throw new ErroHttp(400, 'Informe o telefone que vai receber o lembrete.');
+    // Gate da LGPD: automatizar aviso exige consentimento registrado (D7).
+    if (ativo && !(await consentimentoVigente(g))) {
+      throw new ErroHttp(409, 'Registre o aviso de consentimento deste grupo antes de ligar o lembrete.');
+    }
+
+    // A régua de atraso só existe depois que há uma base de cálculo.
+    const { rows } = await db.query(
+      `update grupos
+          set frequencia_coleta = $2,
+              lembrete_ativo    = $3,
+              lembrete_destino  = $4,
+              proxima_coleta_em = case
+                when $2 = 'manual' then null
+                when ultima_coleta_em is not null
+                  then ultima_coleta_em + ($5 || ' days')::interval
+                else now() + ($5 || ' days')::interval
+              end
+        where id = $1
+      returning id, frequencia_coleta, lembrete_ativo, lembrete_destino,
+                ultima_coleta_em, proxima_coleta_em`,
+      [g, freq, ativo, destino, freq === 'diaria' ? 1 : 7],
+    );
+    return { grupo: rows[0] };
+  }
+
+  if (rota === '/coleta/lembrete' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    if (!(await consentimentoVigente(g))) {
+      throw new ErroHttp(409, 'Registre o aviso de consentimento antes de enviar o lembrete.');
+    }
+    const { rows } = await db.query<{ nome: string; destino: string | null; dias: number | null }>(
+      `select nome, lembrete_destino as destino,
+              case when ultima_coleta_em is null then null
+                   else floor(extract(epoch from (now() - ultima_coleta_em)) / 86400)::int
+              end as dias
+         from grupos where id = $1`, [g]);
+    const alvo = corpo.destino ? normalizarDestino(String(corpo.destino)) : rows[0]?.destino;
+    if (!alvo) throw new ErroHttp(400, 'Informe o telefone que vai receber o lembrete.');
+
+    const r = await dispararLembrete({
+      grupo_id: g, nome: rows[0]?.nome ?? 'grupo', destino: alvo, dias_sem_coleta: rows[0]?.dias ?? null,
+    });
+    if (!r.ok) throw new ErroHttp(502, r.erro ?? 'Não foi possível enviar o lembrete.');
+    return { enviado: true, destino: alvo };
+  }
+
+  if (rota === '/coleta/lembretes') {
+    const g = grupoId(); await exigirAcesso(usuario, g);
+    const { rows } = await db.query(
+      `select id, destino, status, erro, criado_em from lembretes_enviados
+        where grupo_id = $1 order by criado_em desc limit 20`, [g]);
+    return { lembretes: rows };
+  }
+
+  /**
+   * Rodada da cobrança. Chamada pelo systemd timer do servidor, autenticada
+   * como qualquer outra rota — não é endpoint público.
+   */
+  if (rota === '/coleta/executar' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const pendentes = await getGruposParaLembrar(db);
+    const resultados = [];
+    for (const g of pendentes) {
+      const r = await dispararLembrete(g);
+      resultados.push({ grupo: g.nome, ok: r.ok, erro: r.erro });
+    }
+    return { avaliados: pendentes.length, resultados };
+  }
+
+  // ---- canal de aviso (configurado pela interface) ------------------------
+  if (rota === '/conexoes' && req.method === 'GET') {
+    await exigirAdmin(usuario);
+    const { rows } = await db.query(
+      `select ${COLUNAS_CONEXAO} from conexoes order by atualizado_em desc`);
+    return { conexoes: rows };
+  }
+
+  if (rota === '/conexoes' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const endpoint = String(corpo.endpoint ?? '').trim();
+    if (!/^https:\/\//i.test(endpoint)) {
+      throw new ErroHttp(400, 'O endereço da API precisa começar com https://');
+    }
+    const config = {
+      template: String(corpo.template ?? 'lembrete_coleta').trim(),
+      idioma: String(corpo.idioma ?? 'pt_BR').trim(),
+    };
+    const id = corpo.id ? num(String(corpo.id)) : null;
+
+    // Token só é gravado quando vem preenchido: reeditar o canal não pode
+    // apagar o segredo por descuido de quem deixou o campo em branco.
+    let selado = null;
+    if (corpo.token) {
+      try {
+        selado = selar(String(corpo.token));
+      } catch (e) {
+        // Chave de cifra ausente é erro de instalação, não do usuário — mas o
+        // 500 genérico esconderia justamente a informação que resolve.
+        throw new ErroHttp(503, 'O servidor está sem a chave de criptografia (CONEXAO_CHAVE_V1). ' +
+                                'O token não foi gravado.');
+      }
+    }
+
+    if (id) {
+      const { rows } = await db.query(
+        `update conexoes set rotulo=$2, endpoint=$3, remetente=$4, config=$5,
+                atualizado_em=now(),
+                token_cifrado = coalesce($6, token_cifrado),
+                token_iv      = coalesce($7, token_iv),
+                token_tag     = coalesce($8, token_tag),
+                token_versao  = coalesce($9, token_versao)
+          where id=$1 returning ${COLUNAS_CONEXAO}`,
+        [id, String(corpo.rotulo ?? 'Canal de aviso'), endpoint, corpo.remetente ?? null,
+         JSON.stringify(config), selado?.cifrado ?? null, selado?.iv ?? null,
+         selado?.tag ?? null, selado?.versao ?? null]);
+      if (!rows[0]) throw new ErroHttp(404, 'Canal não encontrado.');
+      await db.query(
+        `insert into conexao_eventos (conexao_id, tipo, detalhe) values ($1,$2,$3)`,
+        [id, selado ? 'token_trocado' : 'editada', JSON.stringify(sanitizar(config))]);
+      return { conexao: rows[0] };
+    }
+
+    if (!selado) throw new ErroHttp(400, 'Informe o token da API do Calliope.');
+    const { rows } = await db.query(
+      `insert into conexoes (rotulo, provedor, endpoint, remetente, config,
+                             token_cifrado, token_iv, token_tag, token_versao, criado_por)
+       values ($1,'calliope',$2,$3,$4,$5,$6,$7,$8,$9) returning ${COLUNAS_CONEXAO}`,
+      [String(corpo.rotulo ?? 'Canal de aviso'), endpoint, corpo.remetente ?? null,
+       JSON.stringify(config), selado.cifrado, selado.iv, selado.tag, selado.versao, usuario.id]);
+    await db.query(
+      `insert into conexao_eventos (conexao_id, tipo, detalhe) values ($1,'criada',$2)`,
+      [rows[0].id, JSON.stringify(sanitizar(config))]);
+    return { conexao: rows[0] };
+  }
+
+  if (rota === '/conexoes/testar' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const id = num(q.get('id'));
+    const { rows } = await db.query<{
+      endpoint: string | null; remetente: string | null; config: Record<string, unknown>;
+      token_cifrado: Buffer | null; token_iv: Buffer | null; token_tag: Buffer | null; token_versao: number;
+    }>(`select endpoint, remetente, config, token_cifrado, token_iv, token_tag, token_versao
+          from conexoes where id = $1`, [id]);
+    const c = rows[0];
+    if (!c) throw new ErroHttp(404, 'Canal não encontrado.');
+    if (!c.token_cifrado || !c.token_iv || !c.token_tag || !c.endpoint) {
+      throw new ErroHttp(400, 'Cadastre o endereço e o token antes de testar.');
+    }
+
+    const r = await testarConexao({
+      endpoint: c.endpoint,
+      token: abrir({ cifrado: c.token_cifrado, iv: c.token_iv, tag: c.token_tag, versao: c.token_versao }),
+      remetente: c.remetente ?? undefined,
+      template: String(c.config?.template ?? 'lembrete_coleta'),
+    });
+
+    await db.query(
+      `update conexoes set status=$2, ultima_verificacao_em=now(),
+              erro_mensagem=$3, erro_em = case when $2='erro' then now() else null end,
+              atualizado_em=now()
+        where id=$1`,
+      [id, r.ok ? 'conectado' : 'erro', r.erro ?? null]);
+    await db.query(
+      `insert into conexao_eventos (conexao_id, tipo, detalhe) values ($1,'testada',$2)`,
+      [id, JSON.stringify(sanitizar({ ok: r.ok, status: r.status }))]);
+
+    if (!r.ok) throw new ErroHttp(502, r.erro ?? 'O canal não respondeu.');
+    return { ok: true, status: 'conectado' };
+  }
+
+  if (rota === '/conexoes/remover' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const id = num(q.get('id'));
+    // Zera o segredo em vez de apagar a linha: o histórico de eventos continua
+    // valendo como auditoria de quem ligou o quê, e quando.
+    const { rows } = await db.query(
+      `update conexoes set token_cifrado=null, token_iv=null, token_tag=null,
+              status='desconectado', atualizado_em=now()
+        where id=$1 returning ${COLUNAS_CONEXAO}`, [id]);
+    if (!rows[0]) throw new ErroHttp(404, 'Canal não encontrado.');
+    await db.query(
+      `insert into conexao_eventos (conexao_id, tipo, detalhe) values ($1,'removida','{}')`, [id]);
+    return { conexao: rows[0] };
+  }
+
   throw new ErroHttp(404, 'Rota não encontrada.');
 }
 
@@ -321,10 +645,44 @@ const servidor = createServer(async (req, res) => {
   }
 });
 
+/**
+ * Rotina de cobrança da coleta (D3/D7).
+ *
+ * Roda DENTRO do processo, de hora em hora, em vez de um systemd timer batendo
+ * na API: um timer externo precisaria de credencial em disco ou de um endpoint
+ * sem autenticação — as duas coisas pioram a segurança para automatizar o que
+ * já está aqui dentro.
+ *
+ * `getGruposParaLembrar` é quem garante que ninguém é cobrado duas vezes no
+ * mesmo ciclo e que grupo sem consentimento vigente fica de fora.
+ */
+function iniciarRotinaDeLembretes(intervaloMs = 3600_000) {
+  const rodar = async () => {
+    try {
+      const pendentes = await getGruposParaLembrar(db);
+      if (!pendentes.length) return;
+      let enviados = 0;
+      for (const g of pendentes) {
+        const r = await dispararLembrete(g);
+        if (r.ok) enviados++;
+        else console.error(`[lembrete] ${g.nome}: ${r.erro}`);
+      }
+      console.log(`[lembrete] ${enviados}/${pendentes.length} enviados`);
+    } catch (e) {
+      // Nunca derruba o servidor por causa da rotina.
+      console.error('[lembrete] falhou:', (e as Error).message);
+    }
+  };
+  const timer = setInterval(rodar, intervaloMs);
+  timer.unref?.();          // não segura o processo em pé sozinho
+  setTimeout(rodar, 60_000).unref?.();   // primeira passada 1 min após subir
+}
+
 if (process.env.NODE_ENV !== 'test') {
   await garantirTabelaUsuarios(db);
   servidor.listen(PORTA, '127.0.0.1', () =>
     console.log(`whatsapp-monitor api em 127.0.0.1:${PORTA} (provider: ${provider.nome})`));
+  if (process.env.LEMBRETES !== 'off') iniciarRotinaDeLembretes();
 }
 
 export { servidor, db };
