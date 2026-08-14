@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-monitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"api/**/__tests__/*.test.ts\"",
+    "test:integracao": "node --experimental-strip-types api/ai/__tests__/integracao-pgvector.ts"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

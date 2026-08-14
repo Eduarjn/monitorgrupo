@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base dark ERA: controles nativos (date, select) renderizam no tema escuro. */
+:root { color-scheme: dark; }
+
+body {
+  @apply bg-secondary text-foreground antialiased;
+  font-family: 'Barlow', 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* Scrollbar discreta, alinhada ao tema. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #1e262c; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(206, 255, 0, 0.35); }
+
+::selection { background: rgba(206, 255, 0, 0.25); }

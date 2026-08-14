@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.vercel/
+
+# artefatos de build
+*.tsbuildinfo
+_raw.docx
+
+# nunca versionar segredo ou chave
+.env*.local
+.env.server
+*.pem
+*.key
+*.ppk
+.jwt.json
+
+# exports reais de WhatsApp: contem mensagens de pessoas (LGPD).
+# os fixtures de teste em api/ingestion/__tests__/fixtures sao sinteticos e ficam.
+/exports/
+*.zip
