@@ -17,7 +17,9 @@ empresa.
 Você pode solicitar a exclusão das suas mensagens a qualquer momento pelo \
 responsável do grupo.`;
 
-export default function Consentimento({ grupo, podeGerir }: { grupo: number; podeGerir: boolean }) {
+export default function Consentimento({ grupo, grupoNome, podeGerir }: {
+  grupo: number; grupoNome?: string; podeGerir: boolean;
+}) {
   const [registros, setRegistros] = useState<Registro[] | null>(null);
   const [texto, setTexto] = useState(MODELO);
   const [versao, setVersao] = useState('v1');
@@ -59,8 +61,11 @@ export default function Consentimento({ grupo, podeGerir }: { grupo: number; pod
 
       {podeGerir && (
         <Card>
+          {/* O nome do grupo no título não é enfeite: o aviso é gravado para o
+              grupo do seletor do cabeçalho, e sem isso é fácil registrar no
+              grupo errado sem perceber — foi o que aconteceu no primeiro uso. */}
           <Titulo sub="O texto abaixo é um modelo; ajuste antes de enviar ao grupo.">
-            Registrar aviso
+            Registrar aviso para <span className="text-primary">{grupoNome ?? 'este grupo'}</span>
           </Titulo>
           <div className="space-y-3">
             <textarea
