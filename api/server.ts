@@ -944,8 +944,13 @@ const servidor = createServer(async (req, res) => {
     const erro = e as ErroHttp;
     const status = erro.status ?? 500;
     if (status >= 500) console.error(`[erro] ${url.pathname}:`, erro);
-    // Mensagem genérica em 500: detalhe interno não vaza para o cliente.
-    responder(res, status, { erro: status >= 500 ? 'Erro interno.' : erro.message });
+    // Mensagem genérica só para exceção INESPERADA — aí o detalhe interno não
+    // pode vazar. Quando nós mesmos definimos o status (ErroHttp/ErroEvolution),
+    // a mensagem foi escrita para o usuário ler e precisa chegar inteira: um
+    // 503 "a Evolution não está no ar" virando "Erro interno." só transforma um
+    // diagnóstico de dois segundos numa caça ao log.
+    const nosso = typeof erro?.status === 'number';
+    responder(res, status, { erro: nosso || status < 500 ? erro.message : 'Erro interno.' });
   }
 });
 

@@ -20,6 +20,19 @@ import { ehGrupo, type DriverCaptura, type EstadoConexao, type EstadoInstancia,
 
 const TIMEOUT_MS = 20_000;
 
+/**
+ * Erro com status HTTP embutido. O `rotear()` do servidor já respeita `.status`
+ * do que for lançado, então isto faz a mensagem chegar ao usuário em vez de
+ * virar o "Erro interno." genérico que o handler de 500 produz.
+ */
+export class ErroEvolution extends Error {
+  readonly status: number;
+  constructor(msg: string, status = 502) {
+    super(msg);
+    this.status = status;
+  }
+}
+
 function traduzirEstado(bruto: string | undefined): EstadoInstancia {
   switch ((bruto ?? '').toLowerCase()) {
     case 'open': return 'conectado';
@@ -68,16 +81,36 @@ export class EvolutionDriver implements DriverCaptura {
   private async chamar<T>(
     caminho: string, metodo = 'GET', corpo?: unknown, apikey?: string,
   ): Promise<T> {
-    const resp = await fetch(this.endpoint.replace(/\/+$/, '') + caminho, {
-      method: metodo,
-      headers: {
-        'Content-Type': 'application/json',
-        // Header `apikey` minúsculo, sem Bearer.
-        apikey: apikey ?? this.apikeyGlobal,
-      },
-      body: corpo === undefined ? undefined : JSON.stringify(corpo),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(this.endpoint.replace(/\/+$/, '') + caminho, {
+        method: metodo,
+        headers: {
+          'Content-Type': 'application/json',
+          // Header `apikey` minúsculo, sem Bearer.
+          apikey: apikey ?? this.apikeyGlobal,
+        },
+        body: corpo === undefined ? undefined : JSON.stringify(corpo),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (e) {
+      // `fetch failed` sozinho não diz nada, e o handler de 500 do servidor o
+      // transforma em "Erro interno." — que foi exatamente o que confundiu no
+      // primeiro teste real. A causa quase sempre é o container fora do ar.
+      const causa = (e as { cause?: { code?: string } }).cause?.code
+                 ?? (e as Error).name;
+      const fora = causa === 'ECONNREFUSED' || causa === 'ENOTFOUND'
+                || causa === 'EHOSTUNREACH' || causa === 'ECONNRESET';
+      throw new ErroEvolution(
+        fora
+          ? `A Evolution não respondeu em ${this.endpoint}. O container está no ar? ` +
+            '(docker compose ps em /opt/evolution)'
+          : causa === 'TimeoutError'
+            ? `A Evolution não respondeu em ${TIMEOUT_MS / 1000}s.`
+            : `Falha ao falar com a Evolution (${causa}).`,
+        503,
+      );
+    }
     const texto = await resp.text();
     let dados: unknown;
     try { dados = texto ? JSON.parse(texto) : {}; } catch { dados = { bruto: texto.slice(0, 300) }; }
@@ -86,9 +119,11 @@ export class EvolutionDriver implements DriverCaptura {
       const msg = (dados as { message?: unknown; error?: unknown })?.message
                ?? (dados as { error?: unknown })?.error ?? `HTTP ${resp.status}`;
       if (resp.status === 503) {
-        throw new Error('A Evolution respondeu 503 (licença). A imagem precisa ficar fixada em 2.3.7.');
+        throw new ErroEvolution(
+          'A Evolution respondeu 503 (licença). A imagem precisa ficar fixada em 2.3.7.', 503);
       }
-      throw new Error(`Evolution: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
+      throw new ErroEvolution(
+        `Evolution: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`, 502);
     }
     return dados as T;
   }
@@ -138,8 +173,8 @@ export class EvolutionDriver implements DriverCaptura {
     const conferido = await this.chamar<{ enabled?: boolean; events?: string[] }>(
       `/webhook/find/${encodeURIComponent(nome)}`);
     if (!conferido?.enabled || !(conferido.events ?? []).includes('MESSAGES_UPSERT')) {
-      throw new Error('A Evolution aceitou o POST mas não gravou o webhook. ' +
-                      'Nenhuma mensagem chegaria — confira a versão da imagem.');
+      throw new ErroEvolution('A Evolution aceitou o POST mas não gravou o webhook. ' +
+                              'Nenhuma mensagem chegaria — confira a versão da imagem.', 502);
     }
   }
 
