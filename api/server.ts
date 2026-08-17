@@ -525,6 +525,24 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     const g = num(String(grupo_id));
     await exigirAcesso(usuario, g);
     if (!pergunta?.trim()) throw new ErroHttp(400, 'Informe a pergunta.');
+
+    // "Não encontrei isso no histórico" é tecnicamente correto quando o grupo
+    // nunca foi indexado — e completamente inútil, porque parece falha da IA
+    // quando é falta de um clique. Distinguir os dois casos custa uma query.
+    const { rows: [n] } = await db.query<{ mensagens: number; blocos: number }>(
+      `select (select count(*) from mensagens where grupo_id = $1)::int as mensagens,
+              (select count(*) from blocos    where grupo_id = $1)::int as blocos`, [g]);
+    if (n && n.blocos === 0) {
+      return {
+        pergunta,
+        resposta: n.mensagens === 0
+          ? 'Este grupo ainda não tem nenhuma mensagem. Ligue a captura na aba Coleta ou envie um export na aba Upload.'
+          : `Este grupo tem ${n.mensagens} mensagens, mas nenhuma foi indexada ainda. ` +
+            'Clique em "Reindexar histórico" logo abaixo — é o que cria os vetores que a busca usa.',
+        fontes: [],
+        precisa_indexar: n.mensagens > 0,
+      };
+    }
     return await perguntar(db, provider, g, pergunta, { topK: 8, minSimilaridade: 0.05 });
   }
 
