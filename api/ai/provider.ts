@@ -143,6 +143,128 @@ export class OpenAIProvider implements AIProvider {
   }
 }
 
+// ------------------------------------------------------------------- Gemini
+
+export interface OpcoesGemini {
+  apiKey: string;
+  modeloTexto?: string;
+  modeloEmbedding?: string;
+  baseUrl?: string;
+}
+
+/**
+ * Google Gemini.
+ *
+ * Escolhido em 17/08/2026 por duas razões concretas, não por preferência:
+ *
+ * 1. `gemini-embedding-001` aceita `outputDimensionality`, e 1536 é um dos
+ *    tamanhos recomendados — exatamente a dimensão que `blocos.embedding` já
+ *    usa. Trocar de provedor não exige migração de coluna nem recriar o índice
+ *    HNSW. Verificado contra a API real antes de escrever este código.
+ * 2. Saída estruturada por schema JSON, que é o que a análise estilo Gong
+ *    precisa (`api/ai/analise.ts`). O JSON vem sintaticamente válido por
+ *    construção — os VALORES ainda são validados por `interpretarResposta`.
+ */
+export class GeminiProvider implements AIProvider {
+  readonly nome = 'gemini';
+  readonly dimensaoEmbedding = 1536;
+
+  private readonly apiKey: string;
+  private readonly modeloTexto: string;
+  private readonly modeloEmbedding: string;
+  private readonly baseUrl: string;
+
+  constructor(o: OpcoesGemini) {
+    if (!o.apiKey) throw new Error('GeminiProvider exige apiKey.');
+    this.apiKey = o.apiKey;
+    this.modeloTexto = o.modeloTexto ?? 'gemini-3.6-flash';
+    this.modeloEmbedding = o.modeloEmbedding ?? 'gemini-embedding-001';
+    this.baseUrl = o.baseUrl ?? 'https://generativelanguage.googleapis.com/v1beta';
+  }
+
+  /**
+   * O 503 do Gemini é declaradamente temporário ("high demand"), e o 429 é o
+   * teto do free tier se recompondo. Sem retentativa, um pico do Google faria
+   * a análise daquela janela se perder para sempre — a rotina roda uma vez por
+   * gatilho e não volta. Backoff exponencial, três tentativas.
+   */
+  private async post<T>(caminho: string, corpo: unknown, tentativa = 1): Promise<T> {
+    const resp = await fetch(`${this.baseUrl}${caminho}`, {
+      method: 'POST',
+      // A chave vai no header, não na query string: em URL ela vaza para log de
+      // proxy e histórico de shell.
+      headers: { 'x-goog-api-key': this.apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(corpo),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!resp.ok) {
+      const txt = (await resp.text()).slice(0, 300);
+      const transitorio = resp.status === 503 || resp.status === 429 || resp.status >= 500;
+      if (transitorio && tentativa < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * 2 ** (tentativa - 1)));
+        return this.post<T>(caminho, corpo, tentativa + 1);
+      }
+      if (resp.status === 429) throw new Error(`Gemini: limite de uso atingido (429). ${txt}`);
+      if (resp.status === 503) throw new Error('Gemini está sobrecarregado. Tente de novo em alguns minutos.');
+      throw new Error(`Gemini ${caminho}: HTTP ${resp.status} — ${txt}`);
+    }
+    return resp.json() as Promise<T>;
+  }
+
+  async summarize(texto: string, instrucao = PROMPT_RESUMO): Promise<string> {
+    // A análise (analise.ts) manda um prompt que já pede JSON. Detectar isso
+    // aqui permite ligar a saída estruturada sem mudar a interface de todos os
+    // chamadores — que é o ponto da fronteira única de IA.
+    const querJson = /Responda SOMENTE com JSON/i.test(instrucao);
+    const r = await this.post<{ candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }>(
+      `/models/${this.modeloTexto}:generateContent`,
+      {
+        systemInstruction: { parts: [{ text: instrucao }] },
+        contents: [{ role: 'user', parts: [{ text: texto }] }],
+        generationConfig: {
+          temperature: 0.2,
+          ...(querJson ? { responseMimeType: 'application/json' } : {}),
+        },
+      },
+    );
+    return r.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('').trim() ?? '';
+  }
+
+  async embed(textos: string[]): Promise<number[][]> {
+    if (!textos.length) return [];
+    // batchEmbedContents: uma chamada por lote em vez de uma por texto — o
+    // /indexar de um grupo grande faria centenas de requisições sem isto.
+    const r = await this.post<{ embeddings?: Array<{ values: number[] }> }>(
+      `/models/${this.modeloEmbedding}:batchEmbedContents`,
+      {
+        requests: textos.map((t) => ({
+          model: `models/${this.modeloEmbedding}`,
+          content: { parts: [{ text: t }] },
+          outputDimensionality: this.dimensaoEmbedding,
+        })),
+      },
+    );
+    const vetores = (r.embeddings ?? []).map((e) => e.values);
+    if (vetores.length !== textos.length) {
+      throw new Error(`Gemini devolveu ${vetores.length} embeddings para ${textos.length} textos.`);
+    }
+    // Falha alto em vez de gravar vetor de dimensão errada: a coluna é
+    // vector(1536) e o erro do Postgres seria bem menos claro que este.
+    const errada = vetores.find((v) => v.length !== this.dimensaoEmbedding);
+    if (errada) {
+      throw new Error(`Gemini devolveu embedding de ${errada.length} dimensões, esperado ${this.dimensaoEmbedding}.`);
+    }
+    return vetores;
+  }
+
+  async answer(pergunta: string, contexto: TrechoContexto[]): Promise<string> {
+    const trechos = contexto
+      .map((c, i) => `[${i + 1}] ${c.inicio_em.slice(0, 16).replace('T', ' ')} — ${c.texto}`)
+      .join('\n\n');
+    return this.summarize(`Trechos recuperados:\n\n${trechos}\n\nPergunta: ${pergunta}`, PROMPT_RAG);
+  }
+}
+
 // --------------------------------------------------------------------- mock
 
 /**
@@ -197,9 +319,22 @@ export class MockProvider implements AIProvider {
 
 // ------------------------------------------------------------------- fábrica
 
-/** Sem `OPENAI_API_KEY` no ambiente, o projeto roda no mock — nunca quebra. */
+/**
+ * Sem chave nenhuma o projeto roda no mock — nunca quebra por falta de config.
+ *
+ * Gemini vem primeiro por ser o único que devolve embedding de 1536 dimensões
+ * sem custo: trocar para ele não exige tocar em `blocos.embedding`.
+ * `IA_PROVIDER` força um específico quando houver mais de uma chave presente.
+ */
 export function criarProvider(env: Record<string, string | undefined> = process.env): AIProvider {
-  return env.OPENAI_API_KEY
-    ? new OpenAIProvider({ apiKey: env.OPENAI_API_KEY, modeloTexto: env.OPENAI_MODELO_TEXTO })
-    : new MockProvider();
+  const forcado = (env.IA_PROVIDER ?? '').toLowerCase();
+
+  if (forcado === 'mock') return new MockProvider();
+  if ((forcado === 'gemini' || !forcado) && env.GEMINI_API_KEY) {
+    return new GeminiProvider({ apiKey: env.GEMINI_API_KEY, modeloTexto: env.GEMINI_MODELO_TEXTO });
+  }
+  if ((forcado === 'openai' || !forcado) && env.OPENAI_API_KEY) {
+    return new OpenAIProvider({ apiKey: env.OPENAI_API_KEY, modeloTexto: env.OPENAI_MODELO_TEXTO });
+  }
+  return new MockProvider();
 }

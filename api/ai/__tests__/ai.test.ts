@@ -145,3 +145,24 @@ test('bloco guarda o INSTANTE em UTC e mostra a hora LOCAL no texto', () => {
   assert.equal(bloco.inicio_em, '2026-08-03T12:14:00Z');
   assert.equal(bloco.texto, '09:14 Ana: bom dia');
 });
+
+// ------------------------------------------------------------------ Gemini
+
+test('criarProvider: Gemini tem precedência e mantém 1536 dimensões', () => {
+  const p = criarProvider({ GEMINI_API_KEY: 'x' } as never);
+  assert.equal(p.nome, 'gemini');
+  // 1536 é o que `blocos.embedding vector(1536)` espera — trocar de provedor
+  // não pode exigir migração de coluna.
+  assert.equal(p.dimensaoEmbedding, 1536);
+});
+
+test('criarProvider: IA_PROVIDER força a escolha e mock sempre vence', () => {
+  const ambas = { GEMINI_API_KEY: 'x', OPENAI_API_KEY: 'y' } as never;
+  assert.equal(criarProvider(ambas).nome, 'gemini');
+  assert.equal(criarProvider({ ...ambas as object, IA_PROVIDER: 'openai' } as never).nome, 'openai');
+  assert.equal(criarProvider({ ...ambas as object, IA_PROVIDER: 'mock' } as never).nome, 'mock');
+});
+
+test('criarProvider: sem chave nenhuma cai no mock', () => {
+  assert.equal(criarProvider({} as never).nome, 'mock');
+});
