@@ -1,376 +1,384 @@
-import { useEffect, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Clock, Plug, Send, ShieldAlert, Trash2 } from 'lucide-react';
-import { api, type Conexao, type SaudeColeta } from '../lib/api.ts';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  AlertTriangle, CheckCircle2, Flame, Link2, Loader2, MessageSquareWarning,
+  Power, QrCode, RefreshCw, ShieldAlert, Smartphone, Unlink,
+} from 'lucide-react';
+import { api, type Alerta, type GrupoRemoto, type Instancia } from '../lib/api.ts';
 import { Aviso, Botao, Card, Carregando, Titulo } from '../componentes/ui.tsx';
 
 /**
- * Coleta assistida (D7). O export continua sendo um clique no celular — não
- * existe caminho oficial para ler grupo por API. O que esta tela automatiza é
- * tudo em volta: cobrar quem atrasou, por qual canal, e com que cadência.
+ * Captura em tempo real (D8). O QR pareia o número uma vez; a partir daí as
+ * mensagens dos grupos vinculados chegam por webhook e a IA analisa as janelas
+ * quentes. O upload manual continua na aba Upload — é o backfill do passado,
+ * porque o histórico via Baileys é instável.
  */
 
-const FREQ: Array<{ v: 'diaria' | 'semanal' | 'manual'; r: string }> = [
-  { v: 'semanal', r: 'Semanal' },
-  { v: 'diaria', r: 'Diária' },
-  { v: 'manual', r: 'Sem cobrança' },
-];
+const ESTADOS: Record<Instancia['estado'], { rotulo: string; cor: string; dica: string }> = {
+  conectado:     { rotulo: 'Conectado',    cor: 'text-primary',
+                   dica: 'Recebendo mensagens dos grupos monitorados.' },
+  qr_pendente:   { rotulo: 'Aguardando leitura', cor: 'text-aqua',
+                   dica: 'Abra o WhatsApp no celular e leia o código abaixo.' },
+  conectando:    { rotulo: 'Conectando',   cor: 'text-aqua',
+                   dica: 'Pareou. Sincronizando com o WhatsApp…' },
+  desconectado:  { rotulo: 'Desconectado', cor: 'text-muted-foreground',
+                   dica: 'Nenhuma mensagem está sendo capturada.' },
+  sessao_morta:  { rotulo: 'Sessão encerrada', cor: 'text-destructive',
+                   dica: 'O aparelho desvinculou este dispositivo. É preciso parear de novo.' },
+  erro:          { rotulo: 'Com erro',     cor: 'text-destructive',
+                   dica: 'A Evolution respondeu com erro. Veja o motivo abaixo.' },
+};
 
-const dataCurta = (s: string | null) =>
-  s ? new Date(s).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) : '—';
-
-function Selo({ g }: { g: SaudeColeta }) {
-  if (g.frequencia_coleta === 'manual') {
-    return <span className="rounded-full border border-border px-2 py-0.5 text-[11px] text-muted-foreground">sem cobrança</span>;
-  }
-  if (g.nunca_coletado) {
-    return <span className="rounded-full border border-aqua/50 bg-aqua/10 px-2 py-0.5 text-[11px] text-aqua">nunca coletado</span>;
-  }
-  if (g.atrasado) {
-    return <span className="rounded-full border border-destructive/50 bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive">atrasado</span>;
-  }
-  return <span className="rounded-full border border-primary/50 bg-primary/10 px-2 py-0.5 text-[11px] text-primary">em dia</span>;
-}
+const quando = (s: string | null) =>
+  s ? new Date(s).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
 
 export default function Coleta({ grupo, podeGerir, ehAdmin }: {
   grupo: number; podeGerir: boolean; ehAdmin: boolean;
 }) {
-  const [saude, setSaude] = useState<SaudeColeta[] | null>(null);
+  const [inst, setInst] = useState<Instancia | null>(null);
+  const [configurada, setConfigurada] = useState(true);
+  const [carregando, setCarregando] = useState(true);
   const [erro, setErro] = useState('');
   const [ok, setOk] = useState('');
-  const [salvando, setSalvando] = useState(false);
+  const [ocupado, setOcupado] = useState('');
+  const timer = useRef<number | null>(null);
 
-  const carregar = () =>
-    api.saudeColeta().then((r) => setSaude(r.grupos)).catch((e) => setErro((e as Error).message));
+  const lerInstancia = useCallback(async () => {
+    try {
+      const r = await api.instancia();
+      setInst(r.instancia);
+      setConfigurada(r.configurada);
+    } catch (e) { setErro((e as Error).message); }
+    finally { setCarregando(false); }
+  }, []);
 
-  useEffect(() => { carregar(); }, []);
+  useEffect(() => { lerInstancia(); }, [lerInstancia]);
 
-  // Number nos dois lados: defesa contra id que volte como string do banco.
-  const atual = saude?.find((g) => Number(g.grupo_id) === Number(grupo)) ?? null;
-
-  const [freq, setFreq] = useState<'diaria' | 'semanal' | 'manual'>('semanal');
-  const [ativo, setAtivo] = useState(false);
-  const [destino, setDestino] = useState('');
-
-  // Reflete o grupo selecionado no cabeçalho sempre que ele (ou o dado) mudar.
+  // Enquanto o QR está na tela ele expira a cada ~20s e a Evolution manda outro.
+  // Sem esse polling o usuário leria um código morto e nada aconteceria.
   useEffect(() => {
-    if (!atual) return;
-    setFreq(atual.frequencia_coleta);
-    setAtivo(atual.lembrete_ativo);
-    setDestino(atual.lembrete_destino ?? '');
-  }, [atual?.grupo_id, atual?.frequencia_coleta, atual?.lembrete_ativo, atual?.lembrete_destino]);
+    const precisa = inst?.estado === 'qr_pendente' || inst?.estado === 'conectando';
+    if (!precisa) { if (timer.current) window.clearInterval(timer.current); return; }
+    timer.current = window.setInterval(lerInstancia, 3000);
+    return () => { if (timer.current) window.clearInterval(timer.current); };
+  }, [inst?.estado, lerInstancia]);
 
-  const rodar = async (fn: () => Promise<string>) => {
-    setErro(''); setOk(''); setSalvando(true);
-    try { setOk(await fn()); await carregar(); }
+  const rodar = async (nome: string, fn: () => Promise<string>) => {
+    setErro(''); setOk(''); setOcupado(nome);
+    try { setOk(await fn()); await lerInstancia(); }
     catch (e) { setErro((e as Error).message); }
-    finally { setSalvando(false); }
+    finally { setOcupado(''); }
   };
 
-  if (!saude) return <Carregando texto="lendo a saúde da coleta…" />;
+  if (carregando) return <Carregando texto="lendo o estado da conexão…" />;
 
-  const atrasados = saude.filter((g) => g.atrasado);
+  const e = inst ? ESTADOS[inst.estado] : ESTADOS.desconectado;
 
   return (
     <div className="space-y-6">
       {erro && <Aviso tipo="erro">{erro}</Aviso>}
       {ok && <Aviso tipo="ok">{ok}</Aviso>}
 
-      <Aviso>
-        <div className="flex gap-2">
-          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-aqua" />
-          <span>
-            <b>Não existe conexão automática que leia grupos.</b> Nem por QR Code, nem pela API
-            oficial da Meta — o WhatsApp é criptografado ponta a ponta e o histórico só existe no
-            aparelho. O export continua sendo um clique no celular; o que o painel automatiza é
-            lembrar, cobrar, processar e resumir.
+      {!configurada && ehAdmin && (
+        <Aviso tipo="erro">
+          <div className="flex gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              O servidor está sem <b>EVOLUTION_APIKEY</b> ou <b>CAPTURA_WEBHOOK_SEGREDO</b>.
+              A captura não sobe sem os dois — eles ficam no arquivo de ambiente do serviço,
+              não aqui, porque quem lê o painel não pode ler o segredo.
+            </span>
+          </div>
+        </Aviso>
+      )}
+
+      {/* ---------------- estado da conexão ---------------- */}
+      <Card>
+        <Titulo sub="O número lê os grupos em tempo real. Pareamento é uma vez só.">
+          Conexão do WhatsApp
+        </Titulo>
+
+        <div className="flex flex-wrap items-center gap-4">
+          <span className={'flex items-center gap-2 font-display text-lg font-bold uppercase tracking-wide ' + e.cor}>
+            {inst?.estado === 'conectado' ? <CheckCircle2 className="h-5 w-5" />
+              : inst?.estado === 'qr_pendente' || inst?.estado === 'conectando'
+                ? <Loader2 className="h-5 w-5 animate-spin" />
+                : <Power className="h-5 w-5" />}
+            {e.rotulo}
           </span>
+          {inst?.numero_e164 && (
+            <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+              <Smartphone className="h-4 w-4" />{inst.numero_e164}
+              {inst.perfil_nome && ` · ${inst.perfil_nome}`}
+            </span>
+          )}
         </div>
-      </Aviso>
+        <p className="mt-2 text-sm text-muted-foreground">{e.dica}</p>
+        {inst?.estado_motivo && inst.estado !== 'conectado' && (
+          <p className="mt-1 text-xs text-destructive">Motivo informado: {inst.estado_motivo}</p>
+        )}
 
-      {/* ---------------- painel de saúde ---------------- */}
-      <Card>
-        <Titulo sub={atrasados.length
-          ? `${atrasados.length} ${atrasados.length === 1 ? 'grupo precisa' : 'grupos precisam'} de coleta.`
-          : 'Todos os grupos estão dentro da cadência configurada.'}>
-          Saúde da coleta
-        </Titulo>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-              <tr>
-                <th className="py-2">Grupo</th><th>Situação</th>
-                <th className="text-right">Sem coletar</th>
-                <th className="text-right">Última</th><th className="text-right">Próxima</th>
-                <th>Lembrete</th>
-              </tr>
-            </thead>
-            <tbody>
-              {saude.map((g) => (
-                <tr key={g.grupo_id}
-                    className={'border-t border-border ' +
-                               (Number(g.grupo_id) === Number(grupo) ? 'bg-white/5' : '')}>
-                  <td className="py-2 font-medium">{g.nome}</td>
-                  <td><Selo g={g} /></td>
-                  <td className="text-right tabular-nums">
-                    {g.dias_sem_coleta == null ? '—' : `${g.dias_sem_coleta} d`}
-                  </td>
-                  <td className="text-right text-muted-foreground">{dataCurta(g.ultima_coleta_em)}</td>
-                  <td className="text-right text-muted-foreground">{dataCurta(g.proxima_coleta_em)}</td>
-                  <td className="text-muted-foreground">
-                    {g.lembrete_ativo
-                      ? <span className="inline-flex items-center gap-1 text-primary">
-                          <CheckCircle2 className="h-3.5 w-3.5" />ligado
-                        </span>
-                      : 'desligado'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+        {inst?.estado === 'conectado' && (
+          <div className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
+            <div><span className="text-muted-foreground">Última mensagem</span>
+              <div className="font-medium">{quando(inst.ultima_mensagem_em)}</div></div>
+            <div><span className="text-muted-foreground">Último evento</span>
+              <div className="font-medium">{quando(inst.ultimo_evento_em)}</div></div>
+            <div><span className="text-muted-foreground">Reconexões</span>
+              <div className="font-medium tabular-nums">{inst.reconexoes}</div></div>
+          </div>
+        )}
 
-      {/* ---------------- configuração do grupo ---------------- */}
-      <Card>
-        <Titulo sub="Vale para o grupo selecionado no topo da página.">
-          Cobrança deste grupo
-        </Titulo>
+        {/* ---------------- QR ---------------- */}
+        {inst?.qr_base64 && inst.estado === 'qr_pendente' && (
+          <div className="mt-5 flex flex-col items-center gap-3 rounded-xl border border-border bg-white p-5">
+            {/* fundo branco fixo: QR sobre superfície escura não é lido */}
+            <img src={inst.qr_base64} alt="QR Code para parear o WhatsApp"
+                 className="h-56 w-56" />
+            <p className="text-center text-xs text-[#2C353D]">
+              WhatsApp → <b>Aparelhos conectados</b> → <b>Conectar aparelho</b>
+              <br />O código muda sozinho a cada ~20 segundos.
+            </p>
+          </div>
+        )}
 
-        {!atual ? (
-          <p className="text-sm text-muted-foreground">Selecione um grupo no topo da página.</p>
-        ) : !podeGerir ? (
-          <Aviso>Só um gestor deste grupo pode alterar a cobrança.</Aviso>
-        ) : (
-          <div className="space-y-4">
-            {!atual.consentimento_ok && (
-              <Aviso tipo="erro">
-                <div className="flex gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    Este grupo não tem aviso de consentimento registrado. O lembrete automático
-                    fica bloqueado até você registrar o aviso na aba <b>Consentimento</b> —
-                    é o que a LGPD exige antes de automatizar.
-                  </span>
-                </div>
-              </Aviso>
-            )}
-
-            <div className="flex flex-wrap items-end gap-4">
-              <label className="block">
-                <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">
-                  Cadência
-                </span>
-                <select value={freq} onChange={(e) => setFreq(e.target.value as typeof freq)}
-                        className="rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none focus:border-primary/60">
-                  {FREQ.map((f) => <option key={f.v} value={f.v}>{f.r}</option>)}
-                </select>
-              </label>
-
-              <label className="block">
-                <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">
-                  Quem recebe o lembrete
-                </span>
-                <input value={destino} onChange={(e) => setDestino(e.target.value)}
-                       placeholder="19 93501-0887"
-                       className="w-52 rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none
-                                  placeholder:text-muted-foreground focus:border-primary/60" />
-              </label>
-
-              <label className="flex items-center gap-2 pb-2.5 text-sm">
-                <input type="checkbox" checked={ativo} disabled={!atual.consentimento_ok}
-                       onChange={(e) => setAtivo(e.target.checked)}
-                       className="h-4 w-4 accent-primary disabled:opacity-40" />
-                <span className={atual.consentimento_ok ? '' : 'text-muted-foreground'}>
-                  Cobrar automaticamente
-                </span>
-              </label>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
-              <Botao disabled={salvando}
-                     onClick={() => rodar(async () => {
-                       await api.salvarColeta(grupo, {
-                         frequencia_coleta: freq, lembrete_ativo: ativo,
-                         lembrete_destino: destino || null,
-                       });
-                       return 'Cobrança salva.';
+        {ehAdmin && (
+          <div className="mt-5 flex flex-wrap items-center gap-3">
+            {!inst?.pareada && (
+              <Botao disabled={!!ocupado || !configurada}
+                     onClick={() => rodar('criar', async () => {
+                       await api.criarInstancia();
+                       return 'Instância criada e webhook registrado.';
                      })}>
-                {salvando ? 'Salvando…' : 'Salvar'}
+                {ocupado === 'criar' ? 'Preparando…' : 'Preparar captura'}
               </Botao>
-
-              <button
-                disabled={salvando || !destino}
-                onClick={() => rodar(async () => {
-                  const r = await api.enviarLembrete(grupo, destino || undefined);
-                  return `Lembrete enviado para ${r.destino}.`;
-                })}
-                className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2
-                           font-display text-xs font-semibold uppercase tracking-wider text-muted-foreground
-                           transition hover:border-primary/50 hover:text-primary disabled:opacity-40">
-                <Send className="h-3.5 w-3.5" /> Enviar agora
-              </button>
-
-              {atual.lembrete_enviado_em && (
-                <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <Clock className="h-3.5 w-3.5" />
-                  último lembrete em {new Date(atual.lembrete_enviado_em).toLocaleString('pt-BR')}
+            )}
+            {inst?.pareada && inst.estado !== 'conectado' && (
+              <Botao disabled={!!ocupado}
+                     onClick={() => rodar('conectar', async () => {
+                       const r = await api.conectar();
+                       return r.qr ? 'Leia o código no celular.' : `Estado: ${r.estado}.`;
+                     })}>
+                <span className="inline-flex items-center gap-2">
+                  <QrCode className="h-4 w-4" />
+                  {ocupado === 'conectar' ? 'Gerando…' : 'Gerar QR Code'}
                 </span>
-              )}
-            </div>
+              </Botao>
+            )}
+            {inst?.estado === 'conectado' && (
+              <button disabled={!!ocupado}
+                      onClick={() => rodar('sair', async () => {
+                        await api.desconectarCaptura();
+                        return 'Sessão encerrada. O período sem captura foi registrado como lacuna.';
+                      })}
+                      className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2
+                                 font-display text-xs font-semibold uppercase tracking-wider
+                                 text-muted-foreground transition hover:border-destructive/50
+                                 hover:text-destructive disabled:opacity-40">
+                <Unlink className="h-3.5 w-3.5" /> Desconectar
+              </button>
+            )}
+            <button onClick={lerInstancia}
+                    className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-primary">
+              <RefreshCw className="h-3.5 w-3.5" /> atualizar
+            </button>
           </div>
         )}
       </Card>
 
-      {ehAdmin && <CanalDeAviso onMudou={carregar} />}
+      {ehAdmin && inst?.estado === 'conectado' && <GruposRemotos onMudou={lerInstancia} />}
+
+      <FeedIA grupo={grupo} podeGerir={podeGerir} />
+
+      <Aviso>
+        <div className="flex gap-2">
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-aqua" />
+          <span>
+            A captura só grava mensagens de <b>grupos vinculados e com consentimento registrado</b>.
+            Conversa individual e grupo não vinculado são descartados antes de tocar o disco.
+            O histórico anterior ao momento em que você ligou o monitoramento continua vindo do
+            upload do <code>.txt</code>, na aba <b>Upload</b>.
+          </span>
+        </div>
+      </Aviso>
     </div>
   );
 }
 
-/**
- * Canal por onde o lembrete sai. É o Omnichannel Calliope, que a ERA já opera:
- * entrega hoje o que a Cloud API da Meta só entregaria depois de semanas de
- * verificação de negócio — e sem mexer no número comercial (D7).
- */
-function CanalDeAviso({ onMudou }: { onMudou: () => void }) {
-  const [conexoes, setConexoes] = useState<Conexao[] | null>(null);
+/** Grupos do WhatsApp que o número participa, para ligar o monitoramento. */
+function GruposRemotos({ onMudou }: { onMudou: () => void }) {
+  const [grupos, setGrupos] = useState<GrupoRemoto[] | null>(null);
   const [erro, setErro] = useState('');
-  const [ok, setOk] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const [ocupado, setOcupado] = useState('');
 
-  const [rotulo, setRotulo] = useState('WhatsApp comercial ERA');
-  const [endpoint, setEndpoint] = useState('https://chat1.myuc2b.com:1443/api/v1/template/send');
-  const [remetente, setRemetente] = useState('');
-  const [template, setTemplate] = useState('lembrete_coleta');
-  const [novoToken, setNovoToken] = useState('');
+  const carregar = useCallback(() => {
+    api.gruposRemotos().then((r) => setGrupos(r.grupos))
+      .catch((e) => setErro((e as Error).message));
+  }, []);
+  useEffect(() => { carregar(); }, [carregar]);
 
-  const carregar = () =>
-    api.conexoes().then((r) => {
-      setConexoes(r.conexoes);
-      const c = r.conexoes[0];
-      if (c) {
-        setRotulo(c.rotulo);
-        setEndpoint(c.endpoint ?? '');
-        setRemetente(c.remetente ?? '');
-        setTemplate(c.config?.template ?? 'lembrete_coleta');
-      }
-    }).catch((e) => setErro((e as Error).message));
-
-  useEffect(() => { carregar(); }, []);
-
-  const rodar = async (fn: () => Promise<string>) => {
-    setErro(''); setOk(''); setOcupado(true);
-    try { setOk(await fn()); await carregar(); onMudou(); }
-    catch (e) { setErro((e as Error).message); }
-    finally { setOcupado(false); }
+  const alternar = async (g: GrupoRemoto) => {
+    setErro(''); setOcupado(g.jid);
+    try {
+      if (g.monitorado) await api.desvincularGrupo(g.grupo_id!);
+      else await api.vincularGrupo(g.grupo_id!, g.jid, g.nome);
+      carregar(); onMudou();
+    } catch (e) { setErro((e as Error).message); }
+    finally { setOcupado(''); }
   };
-
-  const atual = conexoes?.[0] ?? null;
 
   return (
     <Card>
-      <Titulo sub="Por onde o painel envia a cobrança. Configurado aqui, não no servidor.">
-        Canal de aviso
+      <Titulo sub="Um clique por grupo. O monitoramento começa a valer a partir de agora — o passado vem do upload.">
+        Grupos disponíveis
       </Titulo>
-
       {erro && <div className="mb-4"><Aviso tipo="erro">{erro}</Aviso></div>}
-      {ok && <div className="mb-4"><Aviso tipo="ok">{ok}</Aviso></div>}
+      {!grupos ? <Carregando texto="lendo os grupos do número…" />
+        : grupos.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            O número não participa de nenhum grupo. Entre nos grupos pelo celular — nunca pela API —
+            e atualize aqui.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {grupos.map((g) => (
+              <div key={g.jid}
+                   className="flex flex-wrap items-center gap-3 rounded-lg border border-border px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium">{g.nome}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {g.participantes != null && `${g.participantes} participantes · `}
+                    {g.grupo_id ? `vinculado a "${g.nome_local}"` : 'sem grupo correspondente no painel'}
+                  </div>
+                </div>
 
-      {atual && (
-        <div className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-white/5 px-4 py-3 text-sm">
-          <Plug className={'h-4 w-4 ' + (atual.status === 'conectado' ? 'text-primary' : 'text-muted-foreground')} />
-          <span className="font-medium">
-            {atual.status === 'conectado' ? 'Conectado'
-              : atual.status === 'erro' ? 'Com erro' : 'Não testado'}
-          </span>
-          {atual.tem_token && <span className="text-xs text-muted-foreground">token cadastrado</span>}
-          {atual.ultima_verificacao_em && (
-            <span className="text-xs text-muted-foreground">
-              testado em {new Date(atual.ultima_verificacao_em).toLocaleString('pt-BR')}
-            </span>
-          )}
-          {atual.erro_mensagem && <span className="text-xs text-destructive">{atual.erro_mensagem}</span>}
+                {g.monitorado && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-primary/50
+                                   bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
+                    <Link2 className="h-3 w-3" /> monitorado
+                  </span>
+                )}
+
+                {!g.grupo_id ? (
+                  <span className="text-xs text-muted-foreground">crie o grupo no painel primeiro</span>
+                ) : !g.consentimento_ok && !g.monitorado ? (
+                  <span className="text-xs text-destructive">registre o consentimento</span>
+                ) : (
+                  <button disabled={ocupado === g.jid} onClick={() => alternar(g)}
+                          className={'rounded-lg border px-3 py-1.5 font-display text-xs font-semibold ' +
+                            'uppercase tracking-wider transition disabled:opacity-40 ' +
+                            (g.monitorado
+                              ? 'border-border text-muted-foreground hover:border-destructive/50 hover:text-destructive'
+                              : 'border-primary bg-primary text-primary-foreground hover:brightness-110')}>
+                    {ocupado === g.jid ? '…' : g.monitorado ? 'Desligar' : 'Ligar Monitoramento IA'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+    </Card>
+  );
+}
+
+/** Feed estilo Gong: o que a IA extraiu das janelas quentes. */
+function FeedIA({ grupo, podeGerir }: { grupo: number; podeGerir: boolean }) {
+  const [alertas, setAlertas] = useState<Alerta[] | null>(null);
+  const [erro, setErro] = useState('');
+
+  const carregar = useCallback(() => {
+    if (!grupo) { setAlertas([]); return; }
+    api.alertas(grupo).then((r) => setAlertas(r.alertas))
+      .catch((e) => setErro((e as Error).message));
+  }, [grupo]);
+  useEffect(() => { carregar(); }, [carregar]);
+
+  const marcar = async (a: Alerta, estado: string) => {
+    try { await api.marcarAlerta(grupo, a.id, estado); carregar(); }
+    catch (e) { setErro((e as Error).message); }
+  };
+
+  const chama = (n: number) =>
+    n >= 5 ? 'text-destructive' : n >= 3 ? 'text-[#FFAA44]' : 'text-muted-foreground';
+
+  return (
+    <Card>
+      <Titulo sub="Menção, termo crítico ou pico de conversa disparam uma análise da janela — não de cada mensagem.">
+        Inteligência do grupo
+      </Titulo>
+      {erro && <div className="mb-4"><Aviso tipo="erro">{erro}</Aviso></div>}
+
+      {!alertas ? <Carregando /> : alertas.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          Nada relevante ainda. O feed enche quando a conversa esquenta — silêncio aqui
+          significa que não houve nada digno de alerta, e isso é resposta, não falha.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          {alertas.map((a) => (
+            <div key={a.id}
+                 className={'rounded-lg border p-4 ' +
+                   (a.estado === 'novo' ? 'border-border bg-white/5' : 'border-border opacity-60')}>
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Flame className={'h-4 w-4 ' + chama(a.severidade)} />
+                <span className="font-display font-semibold uppercase tracking-wider">{a.tipo}</span>
+                <span>· {new Date(a.criado_em).toLocaleString('pt-BR')}</span>
+                {a.temperatura != null && <span>· temperatura {a.temperatura}/5</span>}
+                {a.sentimento && <span>· {a.sentimento}</span>}
+              </div>
+
+              <div className="font-medium">{a.titulo}</div>
+              {a.detalhe && <p className="mt-1 text-sm text-muted-foreground">{a.detalhe}</p>}
+              {a.resumo && <p className="mt-2 whitespace-pre-wrap text-sm">{a.resumo}</p>}
+
+              {a.dados?.pendencias?.length ? (
+                <div className="mt-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-[2px] text-aqua">Pendências</div>
+                  <ul className="mt-1 list-disc pl-5 text-sm text-muted-foreground">
+                    {a.dados.pendencias.map((p, i) => (
+                      <li key={i}>{p.o_que}{p.de_quem && ` — ${p.de_quem}`}{p.prazo && ` (${p.prazo})`}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {a.dados?.dores?.length ? (
+                <div className="mt-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-[2px] text-aqua">Dores</div>
+                  <ul className="mt-1 list-disc pl-5 text-sm text-muted-foreground">
+                    {a.dados.dores.map((d, i) => (
+                      <li key={i}><b>{d.tema}</b>{d.descricao && ` — ${d.descricao}`}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {a.dados?.proximo_passo && (
+                <p className="mt-3 flex gap-2 rounded-lg bg-primary/10 p-3 text-sm">
+                  <MessageSquareWarning className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <span>{a.dados.proximo_passo}</span>
+                </p>
+              )}
+
+              {podeGerir && a.estado !== 'resolvido' && (
+                <div className="mt-3 flex gap-2">
+                  <button onClick={() => marcar(a, 'resolvido')}
+                          className="rounded-lg border border-border px-3 py-1 text-xs
+                                     text-muted-foreground hover:border-primary/50 hover:text-primary">
+                    marcar como resolvido
+                  </button>
+                  {a.estado === 'novo' && (
+                    <button onClick={() => marcar(a, 'visto')}
+                            className="rounded-lg border border-border px-3 py-1 text-xs text-muted-foreground
+                                       hover:text-foreground">
+                      já vi
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <label className="block">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">Nome do canal</span>
-          <input value={rotulo} onChange={(e) => setRotulo(e.target.value)}
-                 className="w-full rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none focus:border-primary/60" />
-        </label>
-        <label className="block">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">Endereço da API</span>
-          <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://…"
-                 className="w-full rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none focus:border-primary/60" />
-        </label>
-        <label className="block">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">Agente / attendance_id</span>
-          <input value={remetente} onChange={(e) => setRemetente(e.target.value)} placeholder="opcional"
-                 className="w-full rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none focus:border-primary/60" />
-        </label>
-        <label className="block">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">Template aprovado</span>
-          <input value={template} onChange={(e) => setTemplate(e.target.value)}
-                 className="w-full rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none focus:border-primary/60" />
-        </label>
-        <label className="block sm:col-span-2">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[2px] text-muted-foreground">
-            Token da API {atual?.tem_token && '(deixe vazio para manter o atual)'}
-          </span>
-          <input type="password" value={novoToken} onChange={(e) => setNovoToken(e.target.value)}
-                 autoComplete="new-password"
-                 placeholder={atual?.tem_token ? '••••••••' : 'cole o token do Calliope'}
-                 className="w-full rounded-lg border border-border bg-white/5 px-3 py-2 text-sm outline-none
-                            placeholder:text-muted-foreground focus:border-primary/60" />
-        </label>
-      </div>
-
-      <p className="mt-3 text-xs text-muted-foreground">
-        O token é gravado cifrado (AES-256-GCM) e nunca é devolvido por nenhuma rota — nem para
-        você, nem mascarado. Para trocá-lo, cole o novo; para conferir, use <b>Testar</b>.
-        Pegue-o no Calliope em <b>Integrações → Token API</b>.
-      </p>
-
-      <div className="mt-4 flex flex-wrap items-center gap-3">
-        <Botao disabled={ocupado}
-               onClick={() => rodar(async () => {
-                 await api.salvarConexao({
-                   id: atual?.id, rotulo, endpoint,
-                   remetente: remetente || undefined, template,
-                   token: novoToken || undefined,
-                 });
-                 setNovoToken('');
-                 return 'Canal salvo.';
-               })}>
-          {ocupado ? 'Salvando…' : 'Salvar canal'}
-        </Botao>
-
-        {atual && (
-          <>
-            <button disabled={ocupado || !atual.tem_token}
-                    onClick={() => rodar(async () => {
-                      await api.testarConexao(atual.id);
-                      return 'O canal respondeu e o token foi aceito.';
-                    })}
-                    className="rounded-lg border border-border px-3 py-2 font-display text-xs font-semibold
-                               uppercase tracking-wider text-muted-foreground transition
-                               hover:border-primary/50 hover:text-primary disabled:opacity-40">
-              Testar
-            </button>
-            <button disabled={ocupado || !atual.tem_token}
-                    onClick={() => rodar(async () => {
-                      await api.removerConexao(atual.id);
-                      return 'Token removido. A cobrança automática para até você cadastrar outro.';
-                    })}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2
-                               font-display text-xs font-semibold uppercase tracking-wider
-                               text-muted-foreground transition hover:border-destructive/50
-                               hover:text-destructive disabled:opacity-40">
-              <Trash2 className="h-3.5 w-3.5" /> Remover token
-            </button>
-          </>
-        )}
-      </div>
     </Card>
   );
 }

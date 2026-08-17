@@ -81,6 +81,32 @@ export interface SaudeColeta {
   lembrete_ativo: boolean; lembrete_destino: string | null; lembrete_enviado_em: string | null;
   consentimento_ok: boolean; mensagens: number;
 }
+export interface Instancia {
+  id: number; rotulo: string; instancia_nome: string;
+  numero_e164: string | null; perfil_nome: string | null;
+  estado: 'desconectado' | 'qr_pendente' | 'conectando' | 'conectado' | 'sessao_morta' | 'erro';
+  estado_motivo: string | null; estado_em: string | null;
+  qr_base64: string | null; qr_contagem: number; qr_em: string | null;
+  ultimo_evento_em: string | null; ultima_mensagem_em: string | null;
+  reconexoes: number; pareada: boolean;
+}
+export interface GrupoRemoto {
+  jid: string; nome: string; participantes: number | null;
+  grupo_id: number | null; nome_local: string | null;
+  monitorado: boolean; consentimento_ok: boolean;
+}
+export interface Alerta {
+  id: number; tipo: string; severidade: number; titulo: string; detalhe: string | null;
+  estado: 'novo' | 'visto' | 'resolvido'; criado_em: string;
+  resumo: string | null; temperatura: number | null; sentimento: string | null;
+  dados: {
+    chamados?: Array<{ quem?: string; por_quem?: string; trecho?: string; respondido?: boolean }>;
+    dores?: Array<{ tema?: string; descricao?: string; quem_relatou?: string }>;
+    pendencias?: Array<{ o_que?: string; de_quem?: string; prazo?: string | null }>;
+    proximo_passo?: string | null;
+  } | null;
+}
+
 /** `tem_token` no lugar do token: o segredo nunca sai da API, nem mascarado. */
 export interface Conexao {
   id: number; rotulo: string; provedor: string;
@@ -144,6 +170,40 @@ export const api = {
   revogarConsentimento: (grupo: number, id: number) =>
     req<{ consentimento: { id: number; revogado_em: string }; consentimento_vigente: boolean }>(
       '/consentimentos/revogar', { method: 'POST', body: JSON.stringify({ grupo_id: grupo, id }) }),
+
+  // ---- captura em tempo real (D8) ----------------------------------------
+  instancia: () => req<{ instancia: Instancia | null; configurada: boolean }>('/captura/instancia'),
+
+  criarInstancia: () =>
+    req<{ instancia: Instancia }>('/captura/instancia', { method: 'POST' }),
+
+  conectar: () =>
+    req<{ qr: string | null; contagem?: number; estado: string }>('/captura/conectar', { method: 'POST' }),
+
+  desconectarCaptura: () => req<{ estado: string }>('/captura/desconectar', { method: 'POST' }),
+
+  gruposRemotos: () => req<{ grupos: GrupoRemoto[] }>('/captura/grupos'),
+
+  vincularGrupo: (grupo: number, wa_jid: string, wa_nome?: string) =>
+    req<{ grupo: unknown }>('/captura/vincular', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, wa_jid, wa_nome }),
+    }),
+
+  desvincularGrupo: (grupo: number) =>
+    req<{ grupo: unknown }>('/captura/desvincular', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo }),
+    }),
+
+  alertas: (grupo: number) => req<{ alertas: Alerta[] }>('/alertas' + qs({ grupo_id: grupo })),
+
+  marcarAlerta: (grupo: number, id: number, estado: string) =>
+    req<{ alerta: unknown }>('/alertas/estado', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, id, estado }),
+    }),
+
+  usoIA: (grupo: number) =>
+    req<{ uso: Array<{ dia: string; chamadas: number; usd: number }>; teto: number }>(
+      '/analise/uso' + qs({ grupo_id: grupo })),
 
   // ---- coleta assistida --------------------------------------------------
   saudeColeta: () => req<{ grupos: SaudeColeta[] }>('/coleta/saude'),

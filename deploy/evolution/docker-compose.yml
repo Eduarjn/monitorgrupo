@@ -1,0 +1,77 @@
+# ============================================================================
+# Evolution API — captura de grupos (D8)
+# Destino: /opt/evolution/docker-compose.yml no 138.59.144.162
+#
+# A topologia oficial sobe 4 serviços (api + manager + redis + postgres).
+# Aqui sobe 1. Os cortes são deliberados e estão explicados abaixo.
+# ============================================================================
+
+services:
+  evolution:
+    # ⚠️ TAG FIXA, NUNCA :latest.
+    # A partir da 2.4.0 toda instância exige ativação contra o servidor de
+    # licenciamento e a API responde 503 LICENSE_REQUIRED em TODAS as rotas.
+    # Um `docker compose pull` com :latest derruba a captura em silêncio.
+    image: evoapicloud/evolution-api:2.3.7
+    container_name: evolution
+    restart: unless-stopped
+
+    # ⚠️ network_mode: host — a decisão mais importante deste arquivo.
+    #
+    # Com a rede bridge padrão, `127.0.0.1` DENTRO do container é o próprio
+    # container, não o servidor. A Evolution não alcançaria nem o Postgres do
+    # host nem a nossa API (que escuta em 127.0.0.1:3020, e assim deve
+    # continuar). O webhook simplesmente nunca chegaria — e o sintoma seria
+    # "conecta e não captura nada", que é o mais caro de diagnosticar.
+    #
+    # O preço: `ports:` não vale aqui, então a Evolution abre a 8080 em TODAS
+    # as interfaces. A regra de firewall abaixo é OBRIGATÓRIA, não opcional.
+    network_mode: host
+
+    env_file: /opt/evolution/.env
+
+    volumes:
+      # Credenciais da sessão do Baileys. Perder isto = novo QR.
+      - evolution_instances:/evolution/instances
+
+    # O dump de sincronização no pareamento pode inflar o heap do Baileys.
+    # Com limite, o container morre e reinicia; sem limite, o OOM killer do
+    # kernel pode escolher o EraLearn como vítima. O servidor tem ~2,3 GB livres.
+    mem_limit: 900m
+    memswap_limit: 900m
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  evolution_instances:
+
+# ============================================================================
+# ANTES DE SUBIR — três comandos, nesta ordem
+# ----------------------------------------------------------------------------
+# 1) Banco próprio (mesmo isolamento do whatsapp_monitor, ver D4):
+#      createdb -U postgres evolution
+#      psql -U postgres -c "create user evolution with password '<senha>';"
+#      psql -U postgres -c "grant all on database evolution to evolution;"
+#
+# 2) FECHAR A 8080 PARA A INTERNET (por causa do network_mode: host):
+#      iptables -I INPUT -p tcp --dport 8080 ! -i lo -j DROP
+#      iptables-save > /etc/iptables/rules.v4
+#    Confira de fora:  curl -m 5 http://138.59.144.162:8080/   → deve dar timeout
+#
+#    (Aproveite e feche a 5432, que está aberta desde o achado da Fase 5.)
+#
+# 3) Subir e acompanhar o primeiro boot:
+#      docker compose up -d && docker compose logs -f
+#
+# O QR NÃO é lido aqui. Ele aparece na aba Coleta do painel, que é quem
+# renderiza o base64 recebido pelo webhook.
+# ============================================================================

@@ -26,6 +26,10 @@ import { perguntar } from './ai/search.ts';
 import { parseTexto } from './ingestion/parser.ts';
 import { hashArquivo } from './ingestion/dedup.ts';
 import { abrir, sanitizar, selar } from './conexao/cripto.ts';
+import { EvolutionDriver, segredoConfere } from './captura/evolution.ts';
+import { ingerirCaptura } from './captura/ingest.ts';
+import { analisarJanela, avaliarGatilho, gerarAlertas, montarJanela,
+         REGRAS_PADRAO, type Regras } from './ai/analise.ts';
 import { enviarTemplate, testarConexao, variaveisDoLembrete,
          type ConfigCalliope } from './conexao/calliope.ts';
 import { getGruposParaLembrar, getSaudeColeta, normalizarDestino,
@@ -40,6 +44,18 @@ if (!SEGREDO) throw new Error('JWT_SECRET é obrigatório (use o mesmo segredo d
 const pool = new pg.Pool({ connectionString: process.env.PGURL, max: 8 });
 const db: DB = { query: (t, p) => pool.query(t, p as never[]) };
 const provider = criarProvider();
+
+// ------------------------------------------------------- captura (D8)
+const EVOLUTION_URL = process.env.EVOLUTION_URL ?? 'http://127.0.0.1:8080';
+const EVOLUTION_APIKEY = process.env.EVOLUTION_APIKEY ?? '';
+/** Segredo do header que a Evolution devolve em todo webhook. */
+const CAPTURA_SEGREDO = process.env.CAPTURA_WEBHOOK_SEGREDO ?? '';
+/** URL que a Evolution chama. Loopback: não passa por nginx nem pela internet. */
+const CAPTURA_CALLBACK = process.env.CAPTURA_CALLBACK
+  ?? `http://127.0.0.1:${process.env.PORTA ?? 3020}/captura/webhook`;
+const INSTANCIA_NOME = process.env.CAPTURA_INSTANCIA ?? 'monitor-grupos';
+
+const driver = new EvolutionDriver(EVOLUTION_URL, EVOLUTION_APIKEY);
 
 // --------------------------------------------------------------- utilidades
 
@@ -123,6 +139,57 @@ async function consentimentoVigente(grupoId: number): Promise<boolean> {
   return rows[0]?.ok === true;
 }
 
+// ------------------------------------------------------- análise em tempo real
+
+/**
+ * Debounce por grupo. É o coração do controle de custo: uma discussão de 40
+ * mensagens em 6 minutos vira UMA análise, não 40 — sem isso o custo é 40×
+ * maior e o feed enche de alerta quase idêntico, que é como um painel desses
+ * perde credibilidade e para de ser olhado.
+ */
+const pendentes = new Map<number, { timer: NodeJS.Timeout; gatilho: string; termo: string }>();
+
+async function regrasDoGrupo(grupoId: number): Promise<Regras> {
+  const { rows } = await db.query<Regras>(
+    `select termos_criticos, mencoes, volume_limite, volume_janela_min, silencio_horas,
+            debounce_seg, ia_ativa, teto_usd_dia::float8 as teto_usd_dia
+       from wa_regras where grupo_id = $1`, [grupoId]);
+  return rows[0] ?? REGRAS_PADRAO;
+}
+
+async function analisarSeGatilho(
+  grupoId: number, _mensagemId: number, m: { conteudo: string; mencionados: string[] },
+): Promise<void> {
+  const regras = await regrasDoGrupo(grupoId);
+  if (!regras.ia_ativa) return;
+
+  const g = avaliarGatilho(m.conteudo, m.mencionados, regras);
+  if (!g) return;
+
+  const jaTem = pendentes.get(grupoId);
+  if (jaTem) clearTimeout(jaTem.timer);   // reinicia a contagem a cada mensagem
+
+  const timer = setTimeout(() => {
+    pendentes.delete(grupoId);
+    rodarAnalise(grupoId, g.gatilho, g.termo)
+      .catch((e) => console.error('[analise]', (e as Error).message));
+  }, Math.max(5, regras.debounce_seg) * 1000);
+  timer.unref?.();
+  pendentes.set(grupoId, { timer, gatilho: g.gatilho, termo: g.termo });
+}
+
+async function rodarAnalise(grupoId: number, gatilho: string, termo: string): Promise<void> {
+  const { rows } = await db.query<{ nome: string }>(
+    `select nome from grupos where id = $1`, [grupoId]);
+  const msgs = await montarJanela(db, grupoId, new Date());
+  if (msgs.length < 3) return;   // janela curta demais não rende análise
+
+  const regras = await regrasDoGrupo(grupoId);
+  const r = await analisarJanela(db, provider, grupoId, rows[0]?.nome ?? 'grupo',
+                                 msgs, gatilho as never, termo, regras);
+  if (!r.doCache) await gerarAlertas(db, grupoId, r.id, r.analise, gatilho as never);
+}
+
 /** Só as colunas seguras. O token cifrado nunca sai daqui — nem mascarado. */
 const COLUNAS_CONEXAO = `id, rotulo, provedor, endpoint, remetente, config, status,
   erro_codigo, erro_mensagem, erro_em, ultima_verificacao_em, ultimo_uso_em,
@@ -196,6 +263,78 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     const u = await autenticar(db, email, senha);
     if (!u) throw new ErroHttp(401, 'E-mail ou senha inválidos.');
     return { token: emitirToken(u, SEGREDO), usuario: u };
+  }
+
+  // ---- webhook da Evolution (D8) -----------------------------------------
+  // PRECISA ficar acima da linha de autenticação: a Evolution não manda Bearer.
+  // Defesa em camadas: (a) a rota não é exposta pelo nginx — a Evolution posta
+  // direto em 127.0.0.1; (b) header secreto comparado em tempo constante.
+  // A 2.3.7 não assina o corpo, então HMAC não está disponível.
+  if (rota === '/captura/webhook' && req.method === 'POST') {
+    if (!CAPTURA_SEGREDO) throw new ErroHttp(503, 'Captura não configurada.');
+    // 401 e 422 ABORTAM o retry da Evolution. 500 seria retentado até 6x, e o
+    // que não conseguimos processar agora não vai melhorar na sexta tentativa.
+    if (!segredoConfere(req.headers['x-captura-segredo'] as string | undefined, CAPTURA_SEGREDO)) {
+      throw new ErroHttp(401, 'Segredo inválido.');
+    }
+    let corpo: unknown;
+    try {
+      corpo = JSON.parse((await lerCorpo(req, 16)).toString() || '{}');
+    } catch {
+      throw new ErroHttp(422, 'Payload ilegível.');
+    }
+
+    // FILTRO LGPD, PRIMEIRO PASSO: `normalizarEvento` devolve null para tudo que
+    // não é grupo. Conversa 1:1 do número monitorado morre aqui, em memória,
+    // sem tocar o disco.
+    const evento = driver.normalizarEvento(corpo);
+    if (!evento) return { ok: true, ignorado: 'fora_de_escopo' };
+
+    if (evento.tipo === 'qr' && evento.qr) {
+      await db.query(
+        `update wa_instancias set estado = 'qr_pendente', qr_base64 = $1,
+                qr_contagem = $2, qr_em = now(), ultimo_evento_em = now(), atualizado_em = now()
+          where instancia_nome = $3`,
+        [evento.qr.base64, evento.qr.contagem, INSTANCIA_NOME]);
+      return { ok: true };
+    }
+
+    if (evento.tipo === 'conexao' && evento.conexao) {
+      const c = evento.conexao;
+      await db.query(
+        `update wa_instancias
+            set estado = $1, estado_motivo = $2, estado_em = now(),
+                numero_e164 = coalesce($3, numero_e164),
+                perfil_nome = coalesce($4, perfil_nome),
+                qr_base64 = case when $1 = 'conectado' then null else qr_base64 end,
+                reconexoes = reconexoes + case when $1 = 'conectado' then 1 else 0 end,
+                ultimo_evento_em = now(), atualizado_em = now()
+          where instancia_nome = $5`,
+        [c.estado, c.motivo ?? null, c.numero_e164 ?? null, c.perfil_nome ?? null, INSTANCIA_NOME]);
+      await db.query(
+        `insert into wa_instancia_eventos (instancia_id, tipo, detalhe)
+         select id, $2, $3 from wa_instancias where instancia_nome = $1`,
+        [INSTANCIA_NOME, c.estado, JSON.stringify(sanitizar({ motivo: c.motivo }))]);
+      return { ok: true };
+    }
+
+    if (evento.tipo === 'mensagem' && evento.mensagem) {
+      // A ingestão é SÍNCRONA — são duas queries rápidas e idempotentes, e é o
+      // que dá durabilidade sem precisar de log de webhook guardando texto de
+      // terceiro. Os outros três portões de LGPD estão dentro dela.
+      const r = await ingerirCaptura(db, evento.mensagem);
+      if (r.estado === 'gravada') {
+        // A IA fica FORA do caminho crítico: uma chamada de modelo leva
+        // segundos, e o socket da Evolution não pode esperar por ela.
+        setImmediate(() => {
+          analisarSeGatilho(r.grupo_id, r.mensagem_id, evento.mensagem!)
+            .catch((e) => console.error('[analise]', (e as Error).message));
+        });
+      }
+      return { ok: true, estado: r.estado };
+    }
+
+    return { ok: true };
   }
 
   const usuario = usuarioDaRequisicao(req);   // daqui para baixo, tudo autenticado
@@ -622,6 +761,171 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     await db.query(
       `insert into conexao_eventos (conexao_id, tipo, detalhe) values ($1,'removida','{}')`, [id]);
     return { conexao: rows[0] };
+  }
+
+  // ---- captura: instância e pareamento (D8) -------------------------------
+  const COLUNAS_INSTANCIA = `id::int as id, rotulo, instancia_nome, numero_e164, perfil_nome,
+    estado, estado_motivo, estado_em, qr_base64, qr_contagem, qr_em,
+    ultimo_evento_em, ultima_mensagem_em, reconexoes,
+    (token_cifrado is not null) as pareada, criado_em, atualizado_em`;
+
+  if (rota === '/captura/instancia' && req.method === 'GET') {
+    await exigirAdmin(usuario);
+    const { rows } = await db.query(
+      `select ${COLUNAS_INSTANCIA} from wa_instancias where instancia_nome = $1`, [INSTANCIA_NOME]);
+    return { instancia: rows[0] ?? null, configurada: !!EVOLUTION_APIKEY && !!CAPTURA_SEGREDO };
+  }
+
+  /** Cria a instância na Evolution e registra o webhook. Idempotente na prática. */
+  if (rota === '/captura/instancia' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    if (!EVOLUTION_APIKEY || !CAPTURA_SEGREDO) {
+      throw new ErroHttp(503, 'O servidor está sem EVOLUTION_APIKEY ou CAPTURA_WEBHOOK_SEGREDO.');
+    }
+    let token = '', uuid: string | null = null;
+    try {
+      const r = await driver.criarInstancia(INSTANCIA_NOME);
+      token = r.token; uuid = r.uuid;
+    } catch (e) {
+      // Já existir não é erro: seguimos para (re)registrar o webhook.
+      if (!/already in use|already exists/i.test((e as Error).message)) throw e;
+    }
+    await driver.registrarWebhook(INSTANCIA_NOME, CAPTURA_CALLBACK, CAPTURA_SEGREDO);
+
+    const selado = token ? selar(token) : null;
+    const { rows } = await db.query(
+      `insert into wa_instancias (rotulo, endpoint, instancia_nome, instancia_uuid,
+                                  token_cifrado, token_iv, token_tag, token_versao, criado_por)
+       values ('Captura de grupos', $1, $2, $3, $4, $5, $6, $7, $8)
+       on conflict (instancia_nome) do update
+         set instancia_uuid = coalesce(excluded.instancia_uuid, wa_instancias.instancia_uuid),
+             token_cifrado  = coalesce(excluded.token_cifrado, wa_instancias.token_cifrado),
+             token_iv       = coalesce(excluded.token_iv, wa_instancias.token_iv),
+             token_tag      = coalesce(excluded.token_tag, wa_instancias.token_tag),
+             atualizado_em  = now()
+       returning ${COLUNAS_INSTANCIA}`,
+      [EVOLUTION_URL, INSTANCIA_NOME, uuid, selado?.cifrado ?? null, selado?.iv ?? null,
+       selado?.tag ?? null, selado?.versao ?? 1, usuario.id]);
+    return { instancia: rows[0] };
+  }
+
+  if (rota === '/captura/conectar' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const r = await driver.conectar(INSTANCIA_NOME);
+    if ('base64' in r) {
+      await db.query(
+        `update wa_instancias set estado='qr_pendente', qr_base64=$1, qr_contagem=$2,
+                qr_em=now(), atualizado_em=now() where instancia_nome=$3`,
+        [r.base64, r.contagem, INSTANCIA_NOME]);
+      return { qr: r.base64, contagem: r.contagem, estado: 'qr_pendente' };
+    }
+    await db.query(`update wa_instancias set estado=$1, estado_em=now() where instancia_nome=$2`,
+                   [r.estado, INSTANCIA_NOME]);
+    return { qr: null, estado: r.estado };
+  }
+
+  if (rota === '/captura/desconectar' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    await driver.desconectar(INSTANCIA_NOME).catch(() => {});
+    await db.query(
+      `update wa_instancias set estado='desconectado', qr_base64=null, estado_em=now(),
+              atualizado_em=now() where instancia_nome=$1`, [INSTANCIA_NOME]);
+    // Sessão caída = buraco no histórico. Registrar é o que permite dizer ao
+    // usuário qual período precisa ser coberto por upload.
+    await db.query(
+      `insert into wa_lacunas (instancia_id, inicio_em, motivo)
+       select id, now(), 'desconexao_manual' from wa_instancias where instancia_nome=$1`,
+      [INSTANCIA_NOME]);
+    return { estado: 'desconectado' };
+  }
+
+  /** Grupos do WhatsApp que o número participa — para escolher o que monitorar. */
+  if (rota === '/captura/grupos') {
+    await exigirAdmin(usuario);
+    const remotos = await driver.listarGrupos(INSTANCIA_NOME);
+    const { rows: locais } = await db.query<{ id: number; nome: string; wa_jid: string | null;
+                                              captura_ativa: boolean; consentimento_ok: boolean }>(
+      `select g.id::int as id, g.nome, g.wa_jid, g.captura_ativa,
+              consentimento_vigente(g.id) as consentimento_ok
+         from grupos g join grupo_acessos a on a.grupo_id = g.id and a.user_id = $1
+        where g.ativo`, [usuario.id]);
+    return {
+      grupos: remotos.map((r) => {
+        const local = locais.find((l) => l.wa_jid === r.jid) ?? null;
+        return { ...r, grupo_id: local?.id ?? null, nome_local: local?.nome ?? null,
+                 monitorado: local?.captura_ativa ?? false,
+                 consentimento_ok: local?.consentimento_ok ?? false };
+      }),
+      locais_sem_vinculo: locais.filter((l) => !l.wa_jid),
+    };
+  }
+
+  /** "Ligar Monitoramento IA" — um botão só, com o gate de LGPD atrás dele. */
+  if (rota === '/captura/vincular' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    const jid = String(corpo.wa_jid ?? '').trim();
+    if (!jid.endsWith('@g.us')) throw new ErroHttp(400, 'Identificador de grupo inválido.');
+
+    // O gate que não se reverte: captura contínua roda sozinha 24h, sem uma
+    // pessoa decidindo por mensagem. Por isso bloqueia, não avisa (D7/D8).
+    if (!(await consentimentoVigente(g))) {
+      throw new ErroHttp(409, 'Registre o aviso de consentimento deste grupo antes de ligar o monitoramento.');
+    }
+    const { rows } = await db.query(
+      `update grupos set wa_jid = $2, wa_nome_remoto = $3, captura_ativa = true,
+              captura_inicio_em = coalesce(captura_inicio_em, now())
+        where id = $1
+      returning id::int as id, nome, wa_jid, captura_ativa, captura_inicio_em`,
+      [g, jid, corpo.wa_nome ?? null]);
+    await db.query(
+      `insert into wa_regras (grupo_id) values ($1) on conflict (grupo_id) do nothing`, [g]);
+    return { grupo: rows[0] };
+  }
+
+  if (rota === '/captura/desvincular' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    const { rows } = await db.query(
+      `update grupos set captura_ativa = false where id = $1
+       returning id::int as id, nome, captura_ativa`, [g]);
+    return { grupo: rows[0] };
+  }
+
+  // ---- feed de inteligência ----------------------------------------------
+  if (rota === '/alertas') {
+    const g = grupoId(); await exigirAcesso(usuario, g);
+    const { rows } = await db.query(
+      `select a.id::int as id, a.tipo, a.severidade, a.titulo, a.detalhe, a.estado,
+              a.criado_em, an.resumo, an.temperatura, an.sentimento, an.dados
+         from wa_alertas a left join wa_analises an on an.id = a.analise_id
+        where a.grupo_id = $1
+        order by a.criado_em desc limit 50`, [g]);
+    return { alertas: rows };
+  }
+
+  if (rota === '/alertas/estado' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g);
+    const estado = String(corpo.estado ?? 'visto');
+    if (!['novo', 'visto', 'resolvido'].includes(estado)) throw new ErroHttp(400, 'Estado inválido.');
+    const { rows } = await db.query(
+      `update wa_alertas set estado = $3, visto_em = now()
+        where id = $1 and grupo_id = $2 returning id::int as id, estado`,
+      [num(String(corpo.id)), g, estado]);
+    if (!rows[0]) throw new ErroHttp(404, 'Alerta não encontrado.');
+    return { alerta: rows[0] };
+  }
+
+  if (rota === '/analise/uso') {
+    const g = grupoId(); await exigirAcesso(usuario, g);
+    const { rows } = await db.query(
+      `select dia, chamadas, usd::float8 as usd from wa_uso_ia
+        where grupo_id = $1 and dia > current_date - 30 order by dia desc`, [g]);
+    return { uso: rows, teto: (await regrasDoGrupo(g)).teto_usd_dia };
   }
 
   throw new ErroHttp(404, 'Rota não encontrada.');

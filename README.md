@@ -65,6 +65,64 @@ dinâmico; empacotado dentro de um bundle ESM, o processo morre no boot com
 `node_modules` no servidor. Este README já derrubou o serviço uma vez por omitir
 essa flag (D7).
 
+## Captura em tempo real (Evolution API)
+
+A ingestão ao vivo usa a **Evolution API self-hosted**, no mesmo servidor, em
+`127.0.0.1:8080`. O tráfego nunca sai da máquina — mesma premissa do resto do
+projeto. Ver `docs/02-decisoes.md`, D8.
+
+> ⚠️ **A imagem fica fixada em `evoapicloud/evolution-api:2.3.7`. Nunca `:latest`.**
+> A partir da 2.4.0 toda instância exige ativação contra o servidor de
+> licenciamento da Evolution Foundation, e sem ela a API responde **503
+> LICENSE_REQUIRED em todas as rotas**. Um `docker compose pull` com `:latest`
+> derruba a captura inteira, em silêncio, no meio da noite. Upgrade para 2.4.x é
+> decisão de negócio, não de infraestrutura.
+
+```yaml
+# /opt/evolution/docker-compose.yml
+services:
+  evolution:
+    image: evoapicloud/evolution-api:2.3.7
+    restart: unless-stopped
+    ports: ["127.0.0.1:8080:8080"]   # só loopback: o nginx nem enxerga
+    env_file: /opt/evolution/.env
+    volumes: ["evolution_instances:/evolution/instances"]
+    mem_limit: 900m                  # estoura o container, não o servidor
+    memswap_limit: 900m
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+volumes:
+  evolution_instances:
+```
+
+O `mem_limit` não é zelo: o dump de sincronização no pareamento pode inflar o
+heap do Baileys, e sem limite o OOM killer levaria o EraLearn junto.
+
+`.env` mínimo (modo 0600):
+
+```bash
+SERVER_URL=http://127.0.0.1:8080
+SERVER_PORT=8080
+AUTHENTICATION_API_KEY=<48 bytes aleatórios — TROCAR o default do exemplo>
+DATABASE_ENABLED=true
+DATABASE_PROVIDER=postgresql
+DATABASE_CONNECTION_URI=postgresql://evolution:***@127.0.0.1:5432/evolution?schema=evolution_api
+DATABASE_SAVE_DATA_NEW_MESSAGE=true
+DATABASE_SAVE_DATA_HISTORIC=false
+CACHE_REDIS_ENABLED=false
+CACHE_LOCAL_ENABLED=true
+QRCODE_LIMIT=6
+DEL_INSTANCE=false
+TELEMETRY_ENABLED=false
+WEBHOOK_GLOBAL_ENABLED=false      # ligar isto E o da instância = cada msg 2x
+WEBHOOK_REQUEST_TIMEOUT_MS=15000
+WEBHOOK_RETRY_MAX_ATTEMPTS=6
+```
+
+**Operação do número** (mitigação de banimento — o risco é real e documentado):
+chip dedicado com SIM físico, entrar nos grupos **manualmente pelo celular**
+antes de parear, e **nunca enviar** por API. O `DriverCaptura` não tem método de
+envio de propósito.
+
 ## Variáveis de ambiente da API
 
 | Variável | Para quê |

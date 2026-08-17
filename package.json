@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test \"api/**/__tests__/*.test.ts\"",
-    "test:integracao": "node --experimental-strip-types api/ai/__tests__/integracao-pgvector.ts"
+    "test:integracao": "node --experimental-strip-types api/ai/__tests__/integracao-pgvector.ts",
+    "conferir:payload": "node --experimental-strip-types api/captura/__tests__/conferir-payload.mts",
+    "build:api": "esbuild api/server.ts --bundle --platform=node --format=esm --external:pg --outfile=dist/server.mjs"
   },
   "dependencies": {
     "pg": "^8.23.0"
