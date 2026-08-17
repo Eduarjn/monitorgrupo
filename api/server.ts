@@ -139,6 +139,29 @@ async function consentimentoVigente(grupoId: number): Promise<boolean> {
   return rows[0]?.ok === true;
 }
 
+/**
+ * Contadores de diagnóstico da captura.
+ *
+ * O filtro de LGPD descarta mensagem sem gravar nada — o que é correto, mas
+ * deixa o pipeline cego: não havia como distinguir "as mensagens estão
+ * chegando e sendo filtradas" de "não está chegando nada". Isso custou uma
+ * rodada de diagnóstico às cegas no primeiro teste real.
+ *
+ * Só CONTAGEM: nenhum conteúdo, nenhum telefone, nada em disco. Zera no
+ * restart, o que é suficiente — é instrumento de diagnóstico, não auditoria
+ * (essa vive em wa_instancia_eventos).
+ */
+const diag = {
+  desde: new Date().toISOString(),
+  eventos: {} as Record<string, number>,
+  mensagens: {} as Record<string, number>,
+  ultimo_evento_em: null as string | null,
+};
+const contar = (balde: Record<string, number>, chave: string) => {
+  balde[chave] = (balde[chave] ?? 0) + 1;
+  diag.ultimo_evento_em = new Date().toISOString();
+};
+
 // ------------------------------------------------------- análise em tempo real
 
 /**
@@ -288,7 +311,13 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     // não é grupo. Conversa 1:1 do número monitorado morre aqui, em memória,
     // sem tocar o disco.
     const evento = driver.normalizarEvento(corpo);
-    if (!evento) return { ok: true, ignorado: 'fora_de_escopo' };
+    if (!evento) {
+      // null aqui é quase sempre conversa 1:1 — o filtro funcionando. Contar
+      // separa isso de "nada está chegando", que é outro problema.
+      contar(diag.eventos, 'descartado_nao_grupo');
+      return { ok: true, ignorado: 'fora_de_escopo' };
+    }
+    contar(diag.eventos, evento.tipo);
 
     if (evento.tipo === 'qr' && evento.qr) {
       await db.query(
@@ -323,6 +352,7 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
       // que dá durabilidade sem precisar de log de webhook guardando texto de
       // terceiro. Os outros três portões de LGPD estão dentro dela.
       const r = await ingerirCaptura(db, evento.mensagem);
+      contar(diag.mensagens, r.estado === 'descartada' ? `descartada:${r.motivo}` : r.estado);
       if (r.estado === 'gravada') {
         // A IA fica FORA do caminho crítico: uma chamada de modelo leva
         // segundos, e o socket da Evolution não pode esperar por ela.
@@ -768,6 +798,25 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     estado, estado_motivo, estado_em, qr_base64, qr_contagem, qr_em,
     ultimo_evento_em, ultima_mensagem_em, reconexoes,
     (token_cifrado is not null) as pareada, criado_em, atualizado_em`;
+
+  /**
+   * Diagnóstico do pipeline: o que chegou e o que foi filtrado, por motivo.
+   * Responde a pergunta "está chegando mensagem?" sem precisar de log da
+   * Evolution (que roda em LOG_LEVEL=ERROR e não registra webhook).
+   */
+  if (rota === '/captura/diagnostico') {
+    await exigirAdmin(usuario);
+    return {
+      contadores: diag,
+      dica: Object.keys(diag.eventos).length === 0
+        ? 'Nenhum evento recebido desde o último restart. Confira se a instância está conectada e se o webhook aponta para a nossa API.'
+        : (diag.mensagens['descartada:grupo_nao_vinculado'] ?? 0) > 0
+          ? 'Mensagens estão chegando e sendo descartadas: os grupos ainda não foram vinculados na aba Coleta.'
+          : (diag.mensagens['descartada:sem_consentimento'] ?? 0) > 0
+            ? 'Grupo vinculado, mas sem aviso de consentimento vigente — registre na aba Consentimento.'
+            : 'Pipeline recebendo normalmente.',
+    };
+  }
 
   if (rota === '/captura/instancia' && req.method === 'GET') {
     await exigirAdmin(usuario);
