@@ -12,7 +12,7 @@ services:
     # A partir da 2.4.0 toda instância exige ativação contra o servidor de
     # licenciamento e a API responde 503 LICENSE_REQUIRED em TODAS as rotas.
     # Um `docker compose pull` com :latest derruba a captura em silêncio.
-    image: evoapicloud/evolution-api:2.3.7
+    image: evoapicloud/evolution-api:v2.3.7
     container_name: evolution
     restart: unless-stopped
 

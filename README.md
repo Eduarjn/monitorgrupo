@@ -68,10 +68,17 @@ essa flag (D7).
 ## Captura em tempo real (Evolution API)
 
 A ingestão ao vivo usa a **Evolution API self-hosted**, no mesmo servidor, em
-`127.0.0.1:8080`. O tráfego nunca sai da máquina — mesma premissa do resto do
+`127.0.0.1:8081`. O tráfego nunca sai da máquina — mesma premissa do resto do
 projeto. Ver `docs/02-decisoes.md`, D8.
 
-> ⚠️ **A imagem fica fixada em `evoapicloud/evolution-api:2.3.7`. Nunca `:latest`.**
+⚠️ **8081, não 8080.** A 8080 é o EraLearn (`vite --port 8080 --host`) e está
+liberada no ufw. Subir a Evolution ali colidiria com ele.
+
+⚠️ **A tag tem prefixo `v`.** No Docker Hub o release é `v2.3.7`; `2.3.7` sem o
+`v` devolve *manifest unknown*. E `latest` aponta para a **2.4.0-rc**, que é
+justamente a versão que exige licença.
+
+> ⚠️ **A imagem fica fixada em `evoapicloud/evolution-api:v2.3.7`. Nunca `:latest`.**
 > A partir da 2.4.0 toda instância exige ativação contra o servidor de
 > licenciamento da Evolution Foundation, e sem ela a API responde **503
 > LICENSE_REQUIRED em todas as rotas**. Um `docker compose pull` com `:latest`
@@ -82,9 +89,9 @@ projeto. Ver `docs/02-decisoes.md`, D8.
 # /opt/evolution/docker-compose.yml
 services:
   evolution:
-    image: evoapicloud/evolution-api:2.3.7
+    image: evoapicloud/evolution-api:v2.3.7
     restart: unless-stopped
-    ports: ["127.0.0.1:8080:8080"]   # só loopback: o nginx nem enxerga
+    network_mode: host               # ver nota abaixo
     env_file: /opt/evolution/.env
     volumes: ["evolution_instances:/evolution/instances"]
     mem_limit: 900m                  # estoura o container, não o servidor
@@ -95,13 +102,20 @@ volumes:
 ```
 
 O `mem_limit` não é zelo: o dump de sincronização no pareamento pode inflar o
-heap do Baileys, e sem limite o OOM killer levaria o EraLearn junto.
+heap do Baileys, e sem limite o OOM killer levaria o EraLearn junto. O servidor
+tem ~2 GB disponíveis — a folga é pequena, acompanhe com `docker stats`.
+
+`network_mode: host` é necessário porque, na rede bridge, `127.0.0.1` dentro do
+container é o próprio container: a Evolution não alcançaria nem o Postgres nem a
+nossa API. Em contrapartida a 8081 fica exposta em todas as interfaces — o ufw
+tem política DROP por padrão e a 8081 não está na lista de ALLOW, então ela já
+nasce fechada. **Não adicione `ufw allow 8081`.**
 
 `.env` mínimo (modo 0600):
 
 ```bash
-SERVER_URL=http://127.0.0.1:8080
-SERVER_PORT=8080
+SERVER_URL=http://127.0.0.1:8081
+SERVER_PORT=8081
 AUTHENTICATION_API_KEY=<48 bytes aleatórios — TROCAR o default do exemplo>
 DATABASE_ENABLED=true
 DATABASE_PROVIDER=postgresql
