@@ -184,6 +184,11 @@ export const api = {
 
   gruposRemotos: () => req<{ grupos: GrupoRemoto[] }>('/captura/grupos'),
 
+  criarGrupoDoWhatsapp: (wa_jid: string, nome: string) =>
+    req<{ grupo: { id: number; nome: string } }>('/captura/criar-grupo', {
+      method: 'POST', body: JSON.stringify({ wa_jid, nome }),
+    }),
+
   vincularGrupo: (grupo: number, wa_jid: string, wa_nome?: string) =>
     req<{ grupo: unknown }>('/captura/vincular', {
       method: 'POST', body: JSON.stringify({ grupo_id: grupo, wa_jid, wa_nome }),

@@ -226,6 +226,16 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
     finally { setOcupado(''); }
   };
 
+  /** Cria o grupo no painel. NÃO liga a captura — falta o consentimento. */
+  const criar = async (g: GrupoRemoto) => {
+    setErro(''); setOcupado(g.jid);
+    try {
+      await api.criarGrupoDoWhatsapp(g.jid, g.nome);
+      carregar(); onMudou();
+    } catch (e) { setErro((e as Error).message); }
+    finally { setOcupado(''); }
+  };
+
   return (
     <Card>
       <Titulo sub="Um clique por grupo. O monitoramento começa a valer a partir de agora — o passado vem do upload.">
@@ -259,9 +269,20 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
                 )}
 
                 {!g.grupo_id ? (
-                  <span className="text-xs text-muted-foreground">crie o grupo no painel primeiro</span>
+                  // Antes isto era só um texto dizendo "crie o grupo no painel
+                  // primeiro" — um beco sem saída, porque não havia onde criar.
+                  <button disabled={ocupado === g.jid} onClick={() => criar(g)}
+                          className="rounded-lg border border-border px-3 py-1.5 font-display text-xs
+                                     font-semibold uppercase tracking-wider text-muted-foreground
+                                     transition hover:border-primary/50 hover:text-primary
+                                     disabled:opacity-40">
+                    {ocupado === g.jid ? '…' : 'Criar no painel'}
+                  </button>
                 ) : !g.consentimento_ok && !g.monitorado ? (
-                  <span className="text-xs text-destructive">registre o consentimento</span>
+                  <span className="text-right text-xs text-destructive">
+                    registre o consentimento<br />
+                    <span className="text-muted-foreground">aba Consentimento</span>
+                  </span>
                 ) : (
                   <button disabled={ocupado === g.jid} onClick={() => alternar(g)}
                           className={'rounded-lg border px-3 py-1.5 font-display text-xs font-semibold ' +

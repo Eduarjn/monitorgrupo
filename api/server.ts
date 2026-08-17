@@ -860,6 +860,40 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     };
   }
 
+  /**
+   * Cria o grupo local a partir de um grupo do WhatsApp.
+   *
+   * Sem isto a tela ficava num beco: listava os grupos remotos e dizia "crie o
+   * grupo no painel primeiro", sem oferecer como. Criar aqui NÃO liga a captura
+   * — só passa a existir no painel, para então registrar o consentimento e só
+   * depois vincular. A ordem importa: é ela que mantém o gate da LGPD honesto.
+   */
+  if (rota === '/captura/criar-grupo' && req.method === 'POST') {
+    await exigirAdmin(usuario);
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const jid = String(corpo.wa_jid ?? '').trim();
+    const nome = String(corpo.nome ?? '').trim();
+    if (!jid.endsWith('@g.us')) throw new ErroHttp(400, 'Identificador de grupo inválido.');
+    if (!nome) throw new ErroHttp(400, 'Informe o nome do grupo.');
+
+    const { rows: existe } = await db.query<{ id: number; nome: string }>(
+      `select id::int as id, nome from grupos where wa_jid = $1`, [jid]);
+    if (existe[0]) throw new ErroHttp(409, `Este grupo já existe no painel como "${existe[0].nome}".`);
+
+    const { rows } = await db.query<{ id: number; nome: string }>(
+      `insert into grupos (nome, wa_jid, wa_nome_remoto, criado_por)
+       values ($1, $2, $1, $3) returning id::int as id, nome`,
+      [nome.slice(0, 120), jid, usuario.id]);
+
+    // Quem cria vira admin do grupo: sem uma linha em grupo_acessos, nem quem
+    // acabou de criar conseguiria abrir o painel dele (exigirAcesso barra).
+    await db.query(
+      `insert into grupo_acessos (grupo_id, user_id, papel) values ($1, $2, 'admin')
+       on conflict do nothing`, [rows[0].id, usuario.id]);
+
+    return { grupo: rows[0] };
+  }
+
   /** "Ligar Monitoramento IA" — um botão só, com o gate de LGPD atrás dele. */
   if (rota === '/captura/vincular' && req.method === 'POST') {
     const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
