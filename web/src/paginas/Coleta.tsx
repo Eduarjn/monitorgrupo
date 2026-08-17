@@ -28,6 +28,13 @@ const ESTADOS: Record<Instancia['estado'], { rotulo: string; cor: string; dica: 
                    dica: 'A Evolution respondeu com erro. Veja o motivo abaixo.' },
 };
 
+/** Texto padrão do aviso. Editável antes de confirmar — é ele que fica gravado. */
+const AVISO_PADRAO = `Este grupo é monitorado pela ERA para fins de gestão.
+
+As mensagens são armazenadas e analisadas por inteligência artificial para gerar resumos e alertas. Nenhum conteúdo é compartilhado fora da empresa.
+
+Você pode solicitar a exclusão das suas mensagens a qualquer momento pelo responsável do grupo.`;
+
 const quando = (s: string | null) =>
   s ? new Date(s).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
 
@@ -209,6 +216,8 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
   const [grupos, setGrupos] = useState<GrupoRemoto[] | null>(null);
   const [erro, setErro] = useState('');
   const [ocupado, setOcupado] = useState('');
+  const [confirmando, setConfirmando] = useState<string | null>(null);
+  const [aviso, setAviso] = useState(AVISO_PADRAO);
 
   const carregar = useCallback(() => {
     api.gruposRemotos().then((r) => setGrupos(r.grupos))
@@ -216,11 +225,13 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
   }, []);
   useEffect(() => { carregar(); }, [carregar]);
 
-  const alternar = async (g: GrupoRemoto) => {
+  const alternar = async (g: GrupoRemoto, comAviso = false) => {
     setErro(''); setOcupado(g.jid);
     try {
       if (g.monitorado) await api.desvincularGrupo(g.grupo_id!);
-      else await api.vincularGrupo(g.grupo_id!, g.jid, g.nome);
+      else await api.vincularGrupo(g.grupo_id!, g.jid, g.nome,
+                                   comAviso ? { texto: aviso } : undefined);
+      setConfirmando(null);
       carregar(); onMudou();
     } catch (e) { setErro((e as Error).message); }
     finally { setOcupado(''); }
@@ -268,7 +279,9 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
                   </span>
                 )}
 
-                {!g.grupo_id ? (
+                {confirmando === g.jid ? (
+                  <span className="text-xs text-muted-foreground">confirme abaixo ↓</span>
+                ) : !g.grupo_id ? (
                   // Antes isto era só um texto dizendo "crie o grupo no painel
                   // primeiro" — um beco sem saída, porque não havia onde criar.
                   <button disabled={ocupado === g.jid} onClick={() => criar(g)}
@@ -279,10 +292,12 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
                     {ocupado === g.jid ? '…' : 'Criar no painel'}
                   </button>
                 ) : !g.consentimento_ok && !g.monitorado ? (
-                  <span className="text-right text-xs text-destructive">
-                    registre o consentimento<br />
-                    <span className="text-muted-foreground">aba Consentimento</span>
-                  </span>
+                  <button onClick={() => setConfirmando(g.jid)}
+                          className="rounded-lg border border-primary bg-primary px-3 py-1.5
+                                     font-display text-xs font-semibold uppercase tracking-wider
+                                     text-primary-foreground transition hover:brightness-110">
+                    Ligar Monitoramento IA
+                  </button>
                 ) : (
                   <button disabled={ocupado === g.jid} onClick={() => alternar(g)}
                           className={'rounded-lg border px-3 py-1.5 font-display text-xs font-semibold ' +
@@ -292,6 +307,31 @@ function GruposRemotos({ onMudou }: { onMudou: () => void }) {
                               : 'border-primary bg-primary text-primary-foreground hover:brightness-110')}>
                     {ocupado === g.jid ? '…' : g.monitorado ? 'Desligar' : 'Ligar Monitoramento IA'}
                   </button>
+                )}
+
+                {/* Confirmação inline: o consentimento é registrado no mesmo
+                    clique, mas só depois de uma afirmação explícita de que o
+                    grupo foi avisado — é isso que o registro precisa provar. */}
+                {confirmando === g.jid && (
+                  <div className="w-full border-t border-border pt-3">
+                    <p className="mb-2 text-xs text-muted-foreground">
+                      Antes de ligar, o grupo precisa saber que é monitorado. Envie este texto
+                      no grupo e confirme abaixo — ele fica registrado com data e autoria.
+                    </p>
+                    <textarea value={aviso} onChange={(e) => setAviso(e.target.value)} rows={4}
+                              className="w-full rounded-lg border border-border bg-white/5 p-3 text-xs
+                                         outline-none focus:border-primary/60" />
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <Botao disabled={ocupado === g.jid || aviso.trim().length < 30}
+                             onClick={() => alternar(g, true)}>
+                        {ocupado === g.jid ? 'Ligando…' : 'Já avisei o grupo — ligar'}
+                      </Botao>
+                      <button onClick={() => setConfirmando(null)}
+                              className="text-xs text-muted-foreground hover:text-foreground">
+                        cancelar
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
             ))}

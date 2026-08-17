@@ -953,8 +953,24 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
 
     // O gate que não se reverte: captura contínua roda sozinha 24h, sem uma
     // pessoa decidindo por mensagem. Por isso bloqueia, não avisa (D7/D8).
+    //
+    // `confirmar_aviso` permite registrar o consentimento aqui, no mesmo clique
+    // — mas só como AFIRMAÇÃO EXPLÍCITA de quem tem papel de gestão: "eu avisei
+    // o grupo". O registro guarda o texto, a versão e quem afirmou, que é
+    // exatamente o que o consentimento precisa provar. Sem isso o usuário
+    // precisava trocar o seletor do cabeçalho e ir a outra aba, e no primeiro
+    // uso real quatro avisos acabaram gravados no grupo errado.
     if (!(await consentimentoVigente(g))) {
-      throw new ErroHttp(409, 'Registre o aviso de consentimento deste grupo antes de ligar o monitoramento.');
+      if (corpo.confirmar_aviso !== true) {
+        throw new ErroHttp(409, 'Registre o aviso de consentimento deste grupo antes de ligar o monitoramento.');
+      }
+      const texto = String(corpo.texto ?? '').trim();
+      if (texto.length < 30) throw new ErroHttp(400, 'O texto do aviso é obrigatório.');
+      await db.query(
+        `insert into consentimentos (grupo_id, versao_texto, texto, base_legal, canal, registrado_por)
+         values ($1, $2, $3, 'consentimento', $4, $5)`,
+        [g, String(corpo.versao_texto ?? 'v1'), texto,
+         String(corpo.canal ?? 'mensagem no grupo'), usuario.id]);
     }
     const { rows } = await db.query(
       `update grupos set wa_jid = $2, wa_nome_remoto = $3, captura_ativa = true,

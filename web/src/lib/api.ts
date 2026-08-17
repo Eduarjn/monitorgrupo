@@ -189,9 +189,15 @@ export const api = {
       method: 'POST', body: JSON.stringify({ wa_jid, nome }),
     }),
 
-  vincularGrupo: (grupo: number, wa_jid: string, wa_nome?: string) =>
+  vincularGrupo: (grupo: number, wa_jid: string, wa_nome?: string,
+                  aviso?: { texto: string; canal?: string }) =>
     req<{ grupo: unknown }>('/captura/vincular', {
-      method: 'POST', body: JSON.stringify({ grupo_id: grupo, wa_jid, wa_nome }),
+      method: 'POST',
+      body: JSON.stringify({
+        grupo_id: grupo, wa_jid, wa_nome,
+        // Afirmação explícita de quem clica: "eu avisei o grupo".
+        ...(aviso ? { confirmar_aviso: true, texto: aviso.texto, canal: aviso.canal } : {}),
+      }),
     }),
 
   desvincularGrupo: (grupo: number) =>
