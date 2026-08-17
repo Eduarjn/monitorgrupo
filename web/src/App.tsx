@@ -130,7 +130,7 @@ export default function App() {
         {grupo && aba !== 'coleta' && (
           <>
             {aba === 'dashboard' && <Dashboard grupo={grupo.id} />}
-            {aba === 'analise' && <Analise grupo={grupo.id} />}
+            {aba === 'analise' && <Analise grupo={grupo.id} grupoNome={grupo.nome} />}
             {aba === 'upload' && <Upload grupo={grupo.id} />}
             {aba === 'lgpd' && (
               <Consentimento grupo={grupo.id} grupoNome={grupo.nome} podeGerir={podeGerir} />

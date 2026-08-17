@@ -3,7 +3,7 @@ import { Sparkles } from 'lucide-react';
 import { api, type Busca, type Resumo } from '../lib/api.ts';
 import { Aviso, Botao, Card, Titulo } from '../componentes/ui.tsx';
 
-export default function Analise({ grupo }: { grupo: number }) {
+export default function Analise({ grupo, grupoNome }: { grupo: number; grupoNome?: string }) {
   const hoje = new Date().toISOString().slice(0, 10);
   const [dia, setDia] = useState(hoje);
   const [resumo, setResumo] = useState<Resumo | null>(null);
@@ -66,8 +66,11 @@ export default function Analise({ grupo }: { grupo: number }) {
       </Card>
 
       <Card>
+        {/* O nome do grupo no título: a busca roda no grupo do seletor do
+            cabeçalho, e perguntar sobre um grupo com outro selecionado devolve
+            "não encontrei" — que parece falha da IA e é só grupo errado. */}
         <Titulo sub="Pergunte em português. A resposta usa só os trechos recuperados e cita as fontes.">
-          Busca no histórico
+          Busca em <span className="text-primary">{grupoNome ?? 'este grupo'}</span>
         </Titulo>
         <form
           className="flex gap-2"
