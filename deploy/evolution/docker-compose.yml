@@ -45,7 +45,7 @@ services:
       options: { max-size: "10m", max-file: "3" }
 
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -62,12 +62,20 @@ volumes:
 #      psql -U postgres -c "create user evolution with password '<senha>';"
 #      psql -U postgres -c "grant all on database evolution to evolution;"
 #
-# 2) FECHAR A 8080 PARA A INTERNET (por causa do network_mode: host):
-#      iptables -I INPUT -p tcp --dport 8080 ! -i lo -j DROP
-#      iptables-save > /etc/iptables/rules.v4
-#    Confira de fora:  curl -m 5 http://138.59.144.162:8080/   → deve dar timeout
+# 2) Firewall — JÁ FEITO em 17/08/2026, mas entenda o porquê:
 #
-#    (Aproveite e feche a 5432, que está aberta desde o achado da Fase 5.)
+#    ⚠️ A porta 8080 NÃO pode ser usada nem bloqueada: é o EraLearn
+#    (`vite --port 8080 --host`), liberado no ufw. Por isso a Evolution roda
+#    na 8081 — em network_mode: host, e como o ufw tem política DROP por
+#    padrão e a 8081 não está na lista de ALLOW, ela já nasce fechada para
+#    fora. Não adicione `ufw allow 8081`.
+#
+#    A 5432 estava aberta para a internet. O Docker publica portas via DNAT e
+#    IGNORA o ufw, então `ufw deny 5432` não teria efeito — a regra correta é
+#    na chain DOCKER-USER, restringindo pela interface externa (preserva o
+#    tráfego entre containers):
+#      iptables -I DOCKER-USER -i ens18 -p tcp --dport 5432 -j DROP
+#    Persistida pelo unit `docker-user-rules.service`.
 #
 # 3) Subir e acompanhar o primeiro boot:
 #      docker compose up -d && docker compose logs -f
