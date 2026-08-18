@@ -32,6 +32,7 @@ import { analisarJanela, avaliarGatilho, gerarAlertas, montarJanela,
          REGRAS_PADRAO, type Regras } from './ai/analise.ts';
 import { enviarTemplate, testarConexao, variaveisDoLembrete,
          type ConfigCalliope } from './conexao/calliope.ts';
+import { executarConsulta, type Consulta } from './consultas/executar.ts';
 import { getGruposParaLembrar, getSaudeColeta, normalizarDestino,
          proximaColeta, type FrequenciaColeta } from './coleta/queries.ts';
 
@@ -1009,6 +1010,96 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
       `update grupos set captura_ativa = false where id = $1
        returning id::int as id, nome, captura_ativa`, [g]);
     return { grupo: rows[0] };
+  }
+
+  // ---- consultas salvas: os cards de um clique ---------------------------
+  const COLUNAS_CONSULTA = `id::int as id, grupo_id::int as grupo_id, titulo, descricao,
+    natureza, metrica, parametro, pergunta, visual, dias, icone, ordem, ativa,
+    execucoes, ultimo_uso_em`;
+
+  if (rota === '/consultas' && req.method === 'GET') {
+    const g = grupoId(); await exigirAcesso(usuario, g);
+    // grupo_id nulo = card global, vale para todos os grupos.
+    const { rows } = await db.query(
+      `select ${COLUNAS_CONSULTA} from consultas
+        where ativa and (grupo_id is null or grupo_id = $1)
+        order by ordem, id`, [g]);
+    return { consultas: rows };
+  }
+
+  if (rota === '/consultas' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+
+    const titulo = String(corpo.titulo ?? '').trim();
+    if (!titulo) throw new ErroHttp(400, 'Informe o título do card.');
+    const natureza = String(corpo.natureza ?? 'pergunta');
+    if (!['metrica', 'pergunta', 'mista'].includes(natureza)) {
+      throw new ErroHttp(400, 'Natureza inválida.');
+    }
+    // Cada natureza exige o seu campo — sem isso o card nasce quebrado e o
+    // usuário só descobre ao clicar.
+    const metrica = corpo.metrica ? String(corpo.metrica) : null;
+    const pergunta = corpo.pergunta ? String(corpo.pergunta).trim() : null;
+    if (natureza !== 'pergunta' && !metrica) throw new ErroHttp(400, 'Escolha a métrica.');
+    if (natureza !== 'metrica' && !pergunta) throw new ErroHttp(400, 'Escreva a pergunta.');
+
+    const campos = [g, titulo.slice(0, 80), corpo.descricao ?? null, natureza, metrica,
+                    corpo.parametro ?? null, pergunta, String(corpo.visual ?? 'auto'),
+                    corpo.dias ? num(String(corpo.dias)) : null,
+                    String(corpo.icone ?? 'sparkles'), usuario.id];
+
+    if (corpo.id) {
+      const { rows } = await db.query(
+        `update consultas set titulo=$2, descricao=$3, natureza=$4, metrica=$5, parametro=$6,
+                pergunta=$7, visual=$8, dias=$9, icone=$10
+          where id=$1 and (grupo_id = $11 or grupo_id is null)
+        returning ${COLUNAS_CONSULTA}`,
+        [num(String(corpo.id)), ...campos.slice(1, 10), g]);
+      if (!rows[0]) throw new ErroHttp(404, 'Card não encontrado.');
+      return { consulta: rows[0] };
+    }
+
+    const { rows } = await db.query(
+      `insert into consultas (grupo_id, titulo, descricao, natureza, metrica, parametro,
+                              pergunta, visual, dias, icone, criado_por)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning ${COLUNAS_CONSULTA}`, campos);
+    return { consulta: rows[0] };
+  }
+
+  if (rota === '/consultas/remover' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    // Desativa em vez de apagar: card global desativado some da lista do grupo
+    // sem sumir para os outros, e o histórico de uso se preserva.
+    const { rows } = await db.query(
+      `update consultas set ativa = false where id = $1 and grupo_id = $2
+       returning id::int as id`, [num(String(corpo.id)), g]);
+    if (!rows[0]) throw new ErroHttp(404, 'Card não encontrado ou é global (não removível por grupo).');
+    return { removida: rows[0].id };
+  }
+
+  if (rota === '/consultas/executar' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g);
+
+    const { rows } = await db.query<Consulta>(
+      `select id::int as id, titulo, descricao, natureza, metrica, parametro, pergunta,
+              visual, dias
+         from consultas
+        where id = $1 and ativa and (grupo_id is null or grupo_id = $2)`,
+      [num(String(corpo.id)), g]);
+    if (!rows[0]) throw new ErroHttp(404, 'Card não encontrado.');
+
+    const r = await executarConsulta(db, provider, g, rows[0]);
+    // Telemetria: card que ninguém clica é card que deve sair do painel.
+    await db.query(
+      `update consultas set execucoes = execucoes + 1, ultimo_uso_em = now() where id = $1`,
+      [rows[0].id]);
+    return r;
   }
 
   // ---- feed de inteligência ----------------------------------------------

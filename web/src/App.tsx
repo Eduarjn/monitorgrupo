@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import {
-  BarChart3, LogOut, MessageSquareText, Plug, Search, ShieldCheck, UploadCloud,
+  BarChart3, LayoutGrid, LogOut, MessageSquareText, Plug, Search, ShieldCheck, UploadCloud,
 } from 'lucide-react';
 import { api, type Grupo } from './lib/api.ts';
 import { useSessao } from './lib/auth.tsx';
@@ -11,11 +11,13 @@ import Upload from './paginas/Upload.tsx';
 import Analise from './paginas/Analise.tsx';
 import Consentimento from './paginas/Consentimento.tsx';
 import Coleta from './paginas/Coleta.tsx';
+import Consultas from './paginas/Consultas.tsx';
 
-type Aba = 'dashboard' | 'analise' | 'upload' | 'coleta' | 'lgpd';
+type Aba = 'dashboard' | 'consultas' | 'analise' | 'upload' | 'coleta' | 'lgpd';
 
 const ABAS: Array<{ id: Aba; rotulo: string; Icone: typeof BarChart3 }> = [
   { id: 'dashboard', rotulo: 'Dashboard', Icone: BarChart3 },
+  { id: 'consultas', rotulo: 'Consultas', Icone: LayoutGrid },
   { id: 'analise', rotulo: 'Resumo e busca', Icone: Search },
   { id: 'upload', rotulo: 'Upload', Icone: UploadCloud },
   { id: 'coleta', rotulo: 'Coleta', Icone: Plug },
@@ -130,6 +132,9 @@ export default function App() {
         {grupo && aba !== 'coleta' && (
           <>
             {aba === 'dashboard' && <Dashboard grupo={grupo.id} />}
+            {aba === 'consultas' && (
+              <Consultas grupo={grupo.id} grupoNome={grupo.nome} podeGerir={podeGerir} />
+            )}
             {aba === 'analise' && <Analise grupo={grupo.id} grupoNome={grupo.nome} />}
             {aba === 'upload' && <Upload grupo={grupo.id} />}
             {aba === 'lgpd' && (

@@ -81,6 +81,45 @@ export interface SaudeColeta {
   lembrete_ativo: boolean; lembrete_destino: string | null; lembrete_enviado_em: string | null;
   consentimento_ok: boolean; mensagens: number;
 }
+export type NaturezaConsulta = 'metrica' | 'pergunta' | 'mista';
+export type VisualConsulta = 'auto' | 'numero' | 'barra' | 'linha' | 'pizza' | 'tabela' | 'texto';
+
+export interface Consulta {
+  id: number;
+  grupo_id: number | null;      // null = card global, vale em todos os grupos
+  titulo: string;
+  descricao: string | null;
+  natureza: NaturezaConsulta;
+  metrica: string | null;
+  parametro: string | null;
+  pergunta: string | null;
+  visual: VisualConsulta;
+  dias: number | null;
+  icone: string;
+  ordem: number;
+  execucoes: number;
+  ultimo_uso_em: string | null;
+}
+
+export interface ResultadoConsulta {
+  consulta_id: number;
+  titulo: string;
+  natureza: string;
+  /** Só existe quando veio de SQL — gráfico nunca é gerado por modelo. */
+  visual?: {
+    tipo: Exclude<VisualConsulta, 'auto'>;
+    titulo: string;
+    unidade: string;
+    series: Array<{ rotulo: string; valor: number }>;
+    total: number;
+    destaque?: { valor: number; rotulo: string };
+  };
+  texto?: string;
+  fontes?: Array<{ bloco_id: number; inicio_em: string; trecho: string; similaridade: number }>;
+  vazio?: boolean;
+  aviso?: string;
+}
+
 export interface Instancia {
   id: number; rotulo: string; instancia_nome: string;
   numero_e164: string | null; perfil_nome: string | null;
@@ -170,6 +209,25 @@ export const api = {
   revogarConsentimento: (grupo: number, id: number) =>
     req<{ consentimento: { id: number; revogado_em: string }; consentimento_vigente: boolean }>(
       '/consentimentos/revogar', { method: 'POST', body: JSON.stringify({ grupo_id: grupo, id }) }),
+
+  // ---- consultas salvas (cards de um clique) -----------------------------
+  consultas: (grupo: number) =>
+    req<{ consultas: Consulta[] }>('/consultas' + qs({ grupo_id: grupo })),
+
+  executarConsulta: (grupo: number, id: number) =>
+    req<ResultadoConsulta>('/consultas/executar', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, id }),
+    }),
+
+  salvarConsulta: (grupo: number, dados: Partial<Consulta> & { titulo: string }) =>
+    req<{ consulta: Consulta }>('/consultas', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, ...dados }),
+    }),
+
+  removerConsulta: (grupo: number, id: number) =>
+    req<{ removida: number }>('/consultas/remover', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, id }),
+    }),
 
   // ---- captura em tempo real (D8) ----------------------------------------
   instancia: () => req<{ instancia: Instancia | null; configurada: boolean }>('/captura/instancia'),
