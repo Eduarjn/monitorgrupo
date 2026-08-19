@@ -95,6 +95,48 @@ async function lerCorpo(req: Req, limiteMB = 64): Promise<Buffer> {
   return Buffer.concat(partes);
 }
 
+/**
+ * Freio de força bruta no login.
+ *
+ * Antes: nenhum limite, nenhum bloqueio e — o pior — nenhum registro. Um 401
+ * não gera log (o handler só loga a partir de 500), então milhares de tentativas
+ * passariam de forma completamente invisível.
+ *
+ * Janela deslizante em memória, por IP. Zera no restart, o que é aceitável:
+ * é freio, não auditoria. Quem passa do teto recebe 429 e é registrado.
+ */
+const TENTATIVAS_MAX = 8;
+const JANELA_LOGIN_MS = 10 * 60_000;
+const tentativas = new Map<string, number[]>();
+
+function ipDaRequisicao(req: Req): string {
+  // Atrás do nginx, o IP real vem no cabeçalho. Só o PRIMEIRO valor importa:
+  // o resto pode ser forjado pelo cliente.
+  const encaminhado = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+  return encaminhado || req.socket.remoteAddress || 'desconhecido';
+}
+
+function freioDeLogin(req: Req): void {
+  const ip = ipDaRequisicao(req);
+  const agora = Date.now();
+  const recentes = (tentativas.get(ip) ?? []).filter((t) => agora - t < JANELA_LOGIN_MS);
+  if (recentes.length >= TENTATIVAS_MAX) {
+    console.error(`[seguranca] login bloqueado por excesso de tentativas: ${ip}`);
+    throw new ErroHttp(429, 'Tentativas demais. Espere alguns minutos e tente de novo.');
+  }
+  recentes.push(agora);
+  tentativas.set(ip, recentes);
+  // Poda simples: sem isto o mapa cresce com IP que nunca mais volta.
+  if (tentativas.size > 5000) {
+    for (const [k, v] of tentativas) {
+      if (!v.some((t) => agora - t < JANELA_LOGIN_MS)) tentativas.delete(k);
+    }
+  }
+}
+
+/** Some com o registro de tentativas do IP depois de um login válido. */
+const limparFreio = (req: Req) => tentativas.delete(ipDaRequisicao(req));
+
 function usuarioDaRequisicao(req: Req): UsuarioSessao {
   const cabecalho = req.headers.authorization ?? '';
   const token = cabecalho.startsWith('Bearer ') ? cabecalho.slice(7) : '';
@@ -211,7 +253,10 @@ async function rodarAnalise(grupoId: number, gatilho: string, termo: string): Pr
   const regras = await regrasDoGrupo(grupoId);
   const r = await analisarJanela(db, provider, grupoId, rows[0]?.nome ?? 'grupo',
                                  msgs, gatilho as never, termo, regras);
-  if (!r.doCache) await gerarAlertas(db, grupoId, r.id, r.analise, gatilho as never);
+  if (!r.doCache) {
+    // Os ids da janela sao a autoridade sobre o que a IA pode citar.
+    await gerarAlertas(db, grupoId, r.id, r.analise, gatilho as never, msgs.map((m) => m.id));
+  }
 }
 
 /** Só as colunas seguras. O token cifrado nunca sai daqui — nem mascarado. */
@@ -282,10 +327,16 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
 
   // ---- autenticação -------------------------------------------------------
   if (rota === '/auth/login' && req.method === 'POST') {
+    freioDeLogin(req);   // antes de tocar no banco: nao paga scrypt para atacante
     const { email, senha } = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
     if (!email || !senha) throw new ErroHttp(400, 'Informe e-mail e senha.');
     const u = await autenticar(db, email, senha);
-    if (!u) throw new ErroHttp(401, 'E-mail ou senha inválidos.');
+    if (!u) {
+      // Registrar a falha e o que torna o ataque visivel — 401 nao gera log.
+      console.error(`[seguranca] login negado para ${String(email).slice(0, 60)} de ${ipDaRequisicao(req)}`);
+      throw new ErroHttp(401, 'E-mail ou senha inválidos.');
+    }
+    limparFreio(req);
     return { token: emitirToken(u, SEGREDO), usuario: u };
   }
 
@@ -1051,6 +1102,14 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
                     String(corpo.icone ?? 'sparkles'), usuario.id];
 
     if (corpo.id) {
+      // Card global (grupo_id null) vale para TODOS os grupos: editar um deles
+      // e acao de conta, nao de grupo. Sem isto, gestor de um grupo qualquer
+      // reescrevia o prompt que todo mundo usa.
+      const { rows: dono } = await db.query<{ grupo_id: number | null }>(
+        `select grupo_id::int as grupo_id from consultas where id = $1`, [num(String(corpo.id))]);
+      if (!dono[0]) throw new ErroHttp(404, 'Card nao encontrado.');
+      if (dono[0].grupo_id === null) await exigirAdmin(usuario);
+
       const { rows } = await db.query(
         `update consultas set titulo=$2, descricao=$3, natureza=$4, metrica=$5, parametro=$6,
                 pergunta=$7, visual=$8, dias=$9, icone=$10
@@ -1117,7 +1176,9 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
   if (rota === '/alertas/estado' && req.method === 'POST') {
     const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
     const g = num(String(corpo.grupo_id));
-    await exigirAcesso(usuario, g);
+    // gerir: a UI ja escondia o botao de leitor, o backend estava mais frouxo
+    // que a interface — e a interface nao e controle de acesso.
+    await exigirAcesso(usuario, g, true);
     const estado = String(corpo.estado ?? 'visto');
     if (!['novo', 'visto', 'resolvido'].includes(estado)) throw new ErroHttp(400, 'Estado inválido.');
     const { rows } = await db.query(
@@ -1195,11 +1256,38 @@ function iniciarRotinaDeLembretes(intervaloMs = 3600_000) {
   setTimeout(rodar, 60_000).unref?.();   // primeira passada 1 min após subir
 }
 
+/**
+ * Expurgo por retenção, uma vez por dia.
+ *
+ * `politica_retencao` existia desde a Fase 1 e nada nunca a leu — o schema
+ * prometia 730 dias e guardava para sempre. Guardar mensagem de terceiro sem
+ * prazo é difícil de justificar sob LGPD, e prometer no schema sem cumprir é
+ * pior do que não prometer.
+ */
+function iniciarExpurgo(intervaloMs = 24 * 3600_000) {
+  const rodar = async () => {
+    try {
+      const { rows } = await db.query<{ grupo_id: number; mensagens_apagadas: number }>(
+        `select * from expurgar_retencao()`);
+      if (rows.length) {
+        const total = rows.reduce((s, r) => s + Number(r.mensagens_apagadas), 0);
+        console.log(`[retencao] ${total} mensagens expurgadas em ${rows.length} grupo(s)`);
+      }
+    } catch (e) {
+      console.error('[retencao] falhou:', (e as Error).message);
+    }
+  };
+  const timer = setInterval(rodar, intervaloMs);
+  timer.unref?.();
+  setTimeout(rodar, 5 * 60_000).unref?.();   // 5 min após subir, fora do pico do boot
+}
+
 if (process.env.NODE_ENV !== 'test') {
   await garantirTabelaUsuarios(db);
   servidor.listen(PORTA, '127.0.0.1', () =>
     console.log(`whatsapp-monitor api em 127.0.0.1:${PORTA} (provider: ${provider.nome})`));
   if (process.env.LEMBRETES !== 'off') iniciarRotinaDeLembretes();
+  if (process.env.RETENCAO !== 'off') iniciarExpurgo();
 }
 
 export { servidor, db };
