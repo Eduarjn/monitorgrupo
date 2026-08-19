@@ -14,6 +14,7 @@ import { getHorariosDePico, getMencoesTermo, getRankingParticipantes,
          getVolumePorAutor, getVolumePorDia } from '../stats/queries.ts';
 import type { AIProvider } from '../ai/provider.ts';
 import { perguntar } from '../ai/search.ts';
+import { gerarRelatorio } from './relatorio.ts';
 
 export type Metrica = 'volume_autor' | 'volume_dia' | 'horario_pico' | 'ranking' | 'mencoes';
 export type Visual = 'auto' | 'numero' | 'barra' | 'linha' | 'pizza' | 'tabela' | 'texto';
@@ -22,7 +23,7 @@ export interface Consulta {
   id: number;
   titulo: string;
   descricao: string | null;
-  natureza: 'metrica' | 'pergunta' | 'mista';
+  natureza: 'metrica' | 'pergunta' | 'mista' | 'relatorio';
   metrica: Metrica | null;
   parametro: string | null;
   pergunta: string | null;
@@ -46,6 +47,10 @@ export interface ResultadoConsulta {
   consulta_id: number;
   titulo: string;
   natureza: string;
+  /** Relatorio completo em Markdown, com graficos Mermaid. */
+  markdown?: string;
+  /** Valores do relatorio que NAO constam no dossie apurado. */
+  numeros_suspeitos?: string[];
   /** Gráfico — só existe quando veio de SQL. Nunca gerado por modelo. */
   visual?: VisualResultado;
   texto?: string;
@@ -143,6 +148,17 @@ export async function executarConsulta(
   db: DB, provider: AIProvider, grupoId: number, c: Consulta,
 ): Promise<ResultadoConsulta> {
   const saida: ResultadoConsulta = { consulta_id: c.id, titulo: c.titulo, natureza: c.natureza };
+
+  // Relatorio tem caminho proprio: o dossie ja carrega todos os agregados, entao
+  // nao passa pelas metricas nem pelo RAG.
+  if (c.natureza === 'relatorio') {
+    const r = await gerarRelatorio(db, provider, grupoId, c.parametro ?? 'geral', c.dias ?? 30);
+    saida.markdown = r.markdown;
+    saida.numeros_suspeitos = r.numeros_suspeitos;
+    saida.vazio = r.vazio;
+    if (r.vazio) saida.aviso = 'Sem mensagens no periodo — nada a relatar.';
+    return saida;
+  }
 
   if (c.natureza === 'metrica' || c.natureza === 'mista') {
     const { vazio, ...visual } = await rodarMetrica(db, grupoId, c);

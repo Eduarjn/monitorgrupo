@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Activity, AlertTriangle, BarChart3, CheckSquare, Clock, Database, Gavel,
-  Loader2, MessageSquare, Plus, Sparkles, Trash2, Users, X,
+  Activity, AlertTriangle, BarChart3, CheckSquare, Clock, Copy, Database,
+  Download, FileText, Gavel, Loader2, MessageSquare, Plus, Sparkles, Trash2, Users, X,
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -34,7 +34,7 @@ const TOOLTIP = {
 const ICONES: Record<string, typeof Sparkles> = {
   users: Users, activity: Activity, clock: Clock, 'check-square': CheckSquare,
   'alert-triangle': AlertTriangle, 'message-square': MessageSquare, gavel: Gavel,
-  sparkles: Sparkles,
+  'file-text': FileText, sparkles: Sparkles,
 };
 
 const METRICAS = [
@@ -46,8 +46,28 @@ const METRICAS = [
 
 const num = (n: number) => n.toLocaleString('pt-BR');
 
+/** Entrega o relatorio como arquivo .md, que e o formato pedido. */
+function baixarMarkdown(titulo: string, conteudo: string) {
+  const nome = titulo.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'relatorio';
+  const url = URL.createObjectURL(new Blob([conteudo], { type: 'text/markdown;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${nome}-${new Date().toISOString().slice(0, 10)}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 /** Selo da origem do dado. É informação, não enfeite. */
 function SeloOrigem({ natureza }: { natureza: string }) {
+  if (natureza === 'relatorio') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-aqua/40 bg-aqua/10
+                       px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-aqua">
+        <FileText className="h-3 w-3" /> relatório .md
+      </span>
+    );
+  }
   if (natureza === 'metrica') {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-aqua/40 bg-aqua/10
@@ -266,6 +286,47 @@ export default function Consultas({ grupo, grupoNome, podeGerir }: {
               <p className="text-xs text-muted-foreground">
                 {num(resultado.visual.total)} {resultado.visual.unidade} no período ·
                 {' '}contagem direta do banco, sem IA
+              </p>
+            </div>
+          )}
+
+          {resultado.markdown && (
+            <div className="space-y-3">
+              {resultado.numeros_suspeitos && resultado.numeros_suspeitos.length > 0 && (
+                <Aviso tipo="erro">
+                  A conferência automática encontrou os valores{' '}
+                  <b>{resultado.numeros_suspeitos.join(', ')}</b> no relatório sem correspondência
+                  no dossiê apurado. Trate-os como não confiáveis.
+                </Aviso>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => navigator.clipboard?.writeText(resultado.markdown ?? '')}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-border
+                                   px-3 py-1.5 font-display text-xs font-semibold uppercase
+                                   tracking-wider text-muted-foreground transition
+                                   hover:border-primary/50 hover:text-primary">
+                  <Copy className="h-3.5 w-3.5" /> Copiar Markdown
+                </button>
+                <button onClick={() => baixarMarkdown(resultado.titulo, resultado.markdown ?? '')}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-border
+                                   px-3 py-1.5 font-display text-xs font-semibold uppercase
+                                   tracking-wider text-muted-foreground transition
+                                   hover:border-primary/50 hover:text-primary">
+                  <Download className="h-3.5 w-3.5" /> Baixar .md
+                </button>
+              </div>
+
+              {/* Markdown cru e monoespaçado: é o formato de entrega. Os blocos
+                  mermaid renderizam em qualquer visualizador que os suporte
+                  (GitHub, Notion, VS Code) — aqui o valor é o texto exato. */}
+              <pre className="max-h-[32rem] overflow-auto rounded-lg border border-border bg-white/5
+                              p-4 text-xs leading-relaxed">
+                <code>{resultado.markdown}</code>
+              </pre>
+              <p className="text-xs text-muted-foreground">
+                Todos os números foram apurados no banco e conferidos contra o relatório.
+                Os gráficos usam sintaxe Mermaid — cole no GitHub, Notion ou VS Code para ver desenhado.
               </p>
             </div>
           )}

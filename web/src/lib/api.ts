@@ -81,7 +81,7 @@ export interface SaudeColeta {
   lembrete_ativo: boolean; lembrete_destino: string | null; lembrete_enviado_em: string | null;
   consentimento_ok: boolean; mensagens: number;
 }
-export type NaturezaConsulta = 'metrica' | 'pergunta' | 'mista';
+export type NaturezaConsulta = 'metrica' | 'pergunta' | 'mista' | 'relatorio';
 export type VisualConsulta = 'auto' | 'numero' | 'barra' | 'linha' | 'pizza' | 'tabela' | 'texto';
 
 export interface Consulta {
@@ -105,6 +105,10 @@ export interface ResultadoConsulta {
   consulta_id: number;
   titulo: string;
   natureza: string;
+  /** Relatorio completo em Markdown, com graficos Mermaid. */
+  markdown?: string;
+  /** Valores do relatorio sem correspondencia no dossie apurado. */
+  numeros_suspeitos?: string[];
   /** Só existe quando veio de SQL — gráfico nunca é gerado por modelo. */
   visual?: {
     tipo: Exclude<VisualConsulta, 'auto'>;
