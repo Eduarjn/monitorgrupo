@@ -21,6 +21,7 @@ import type { DB } from '../stats/queries.ts';
 import { getHorariosDePico, getRankingParticipantes, getVolumePorDia } from '../stats/queries.ts';
 import type { AIProvider } from '../ai/provider.ts';
 import { neutralizar } from '../ai/analise.ts';
+import { montarMarkdown, type Narrativa } from './markdown.ts';
 
 export interface Dossie {
   grupo: string;
@@ -110,31 +111,51 @@ export async function montarDossie(
 }
 
 export const PROMPT_RELATORIO = `Você é o motor de inteligência analítica da plataforma ERA (PABX em Nuvem e Omnichannel).
-Recebe um DOSSIÊ já apurado e devolve um relatório executivo em Markdown.
 
-REGRA ABSOLUTA SOBRE NÚMEROS:
-- Todo número que você escrever DEVE ser copiado literalmente do dossiê. Nunca some, calcule, estime, arredonde ou complete.
-- Se um dado não está no dossiê, ele não existe: escreva "sem dado" em vez de inventar.
-- Isso vale especialmente para os gráficos Mermaid: os valores vêm do dossiê, sem exceção.
+Recebe um DOSSIÊ já apurado no banco e devolve APENAS a parte interpretativa de um
+relatório executivo. Os números, tabelas e gráficos são montados por código — você
+NÃO precisa reproduzi-los e NÃO deve calcular nada.
 
-O QUE VOCÊ PRODUZ:
-1. APENAS Markdown. Sem conversa, sem preâmbulo, sem "aqui está".
-2. Comece com um título e uma linha de período.
-3. Uma seção "Resumo executivo" com 3 a 5 frases de leitura de negócio — o que os números significam para este nicho, não o que eles são.
-4. Pelo menos UM gráfico Mermaid. Use o formato exato:
-   \`\`\`mermaid
-   pie title Mensagens por tipo
-     "texto" : 120
-   \`\`\`
-   Para série temporal use xychart-beta; para composição use pie. Rótulos sempre entre aspas.
-5. Uma tabela Markdown com o desempenho por participante (nome, mensagens, % de participação).
-6. Uma seção "Alertas" com as dores CRÍTICAS DESTE NICHO, não genéricas. Cada alerta precisa se apoiar num dado do dossiê.
-7. Uma seção "Recomendações" com no máximo 3 ações concretas para a gestão.
+Devolva SOMENTE JSON válido, neste formato:
+{
+  "resumo": "3 a 5 frases dizendo o que os números SIGNIFICAM para o negócio deste nicho, não o que eles são",
+  "alertas": [
+    {"titulo": "curto e direto", "explicacao": "por que isso importa, apoiado num dado do dossiê", "severidade": "alta|media|baixa"}
+  ],
+  "recomendacoes": ["ação concreta para a gestão", "no máximo 3"]
+}
 
-SOBRE O NICHO:
-Ajuste a leitura ao nicho informado. Provedor de internet sofre com integração de ERP e chamado de suporte repetido; imobiliária vive de discador e velocidade de retorno ao lead; saúde depende de agendamento, confirmação e no-show; varejo tem pico sazonal e fila de atendimento. Fale a língua do negócio do cliente.
+REGRAS:
+- Nunca invente número. Se citar um valor, ele tem que estar no dossiê.
+- Alertas devem ser as dores CRÍTICAS DO NICHO informado, não genéricas.
+- Se o volume for baixo demais para conclusão, diga isso no resumo e devolva poucos alertas — forçar análise sobre dado ralo é pior que admitir que falta dado.
+- Português do Brasil, objetivo, sem adjetivo de vendedor.
 
-TOM: objetivo, em português do Brasil, sem adjetivo de vendedor. Se o volume for baixo demais para conclusão, diga isso em vez de forçar análise.`;
+SOBRE O NICHO: provedor de internet sofre com integração de ERP e chamado repetido; imobiliária vive de discador e velocidade de retorno ao lead; saúde depende de agendamento, confirmação e no-show; varejo tem pico sazonal e fila. Fale a língua do negócio do cliente.`;
+
+/** Lê a narrativa com desconfiança: modelo devolvendo prosa em volta do JSON é o modo de falha comum. */
+export function interpretarNarrativa(bruto: string): Narrativa {
+  const vazia: Narrativa = { resumo: '', alertas: [], recomendacoes: [] };
+  const i = bruto.indexOf('{'); const j = bruto.lastIndexOf('}');
+  if (i < 0 || j <= i) return { ...vazia, resumo: bruto.trim().slice(0, 800) };
+  let o: Record<string, unknown>;
+  try { o = JSON.parse(bruto.slice(i, j + 1)); } catch { return { ...vazia, resumo: bruto.trim().slice(0, 800) }; }
+
+  const sev = (v: unknown) => (['alta', 'media', 'baixa'].includes(String(v)) ? String(v) : 'media');
+  return {
+    resumo: typeof o.resumo === 'string' ? o.resumo.trim() : '',
+    alertas: (Array.isArray(o.alertas) ? o.alertas : []).slice(0, 8)
+      .filter((a): a is Record<string, unknown> => !!a && typeof a === 'object' && !!a.titulo)
+      .map((a) => ({
+        // Pipe e quebra de linha destruiriam a tabela Markdown em que o alerta cai.
+        titulo: String(a.titulo).replace(/[|\r\n]/g, ' ').slice(0, 120),
+        explicacao: String(a.explicacao ?? '').replace(/[|\r\n]/g, ' ').slice(0, 300),
+        severidade: sev(a.severidade) as 'alta' | 'media' | 'baixa',
+      })),
+    recomendacoes: (Array.isArray(o.recomendacoes) ? o.recomendacoes : []).slice(0, 3)
+      .map((r) => String(r).replace(/[\r\n]/g, ' ').slice(0, 300)).filter(Boolean),
+  };
+}
 
 /**
  * Confere se os números do relatório existem no dossiê.
@@ -181,31 +202,27 @@ export async function gerarRelatorio(
 ): Promise<RelatorioGerado> {
   const dossie = await montarDossie(db, grupoId, neutralizar(nicho, 60) || 'geral', dias);
 
+  // Sem dado nao ha o que interpretar — nao gasta chamada de modelo.
   if (dossie.totais.mensagens === 0) {
     return {
-      markdown: `# ${dossie.grupo}\n\n_Sem mensagens entre ${dossie.periodo.inicio} e ` +
-                `${dossie.periodo.fim}. Não há o que relatar._\n`,
+      markdown: montarMarkdown(dossie, {
+        resumo: `Sem mensagens entre ${dossie.periodo.inicio} e ${dossie.periodo.fim}. ` +
+                'Não há base para análise no período.',
+        alertas: [], recomendacoes: [],
+      }),
       dossie, numeros_suspeitos: [], vazio: true,
     };
   }
 
-  const markdown = await provider.summarize(
-    `DOSSIÊ (todos os números já apurados — copie, não recalcule):\n\n` +
-    JSON.stringify(dossie, null, 2),
+  const bruto = await provider.summarize(
+    'DOSSIÊ (todos os números já apurados pelo banco):\n\n' + JSON.stringify(dossie, null, 2),
     PROMPT_RELATORIO,
   );
+  const narrativa = interpretarNarrativa(bruto);
+  const markdown = montarMarkdown(dossie, narrativa);
 
-  const limpo = markdown
-    .replace(/^```(?:markdown|md)\s*\n/i, '')   // modelo às vezes cerca tudo em bloco
-    .replace(/\n```\s*$/i, '')
-    .trim();
-
-  const suspeitos = conferirNumeros(limpo, dossie);
-  const aviso = suspeitos.length
-    ? `\n\n---\n\n> ⚠️ **Conferência automática:** os valores ${suspeitos.join(', ')} ` +
-      `aparecem no relatório mas não constam no dossiê apurado. Trate-os como não ` +
-      `confiáveis — o restante dos números foi conferido contra o banco.\n`
-    : '';
-
-  return { markdown: limpo + aviso, dossie, numeros_suspeitos: suspeitos, vazio: false };
+  // A conferencia continua, mas agora e cinto e suspensorio: os numeros do
+  // relatorio sao escritos por codigo, entao so poderiam divergir se a IA
+  // citasse um valor dentro do texto narrativo.
+  return { markdown, dossie, numeros_suspeitos: conferirNumeros(markdown, dossie), vazio: false };
 }

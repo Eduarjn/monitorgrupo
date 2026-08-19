@@ -33,6 +33,7 @@ import { analisarJanela, avaliarGatilho, gerarAlertas, montarJanela,
 import { enviarTemplate, testarConexao, variaveisDoLembrete,
          type ConfigCalliope } from './conexao/calliope.ts';
 import { executarConsulta, type Consulta } from './consultas/executar.ts';
+import { montarDossie } from './consultas/relatorio.ts';
 import { getGruposParaLembrar, getSaudeColeta, normalizarDestino,
          proximaColeta, type FrequenciaColeta } from './coleta/queries.ts';
 
@@ -1159,6 +1160,19 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
       `update consultas set execucoes = execucoes + 1, ultimo_uso_em = now() where id = $1`,
       [rows[0].id]);
     return r;
+  }
+
+  /**
+   * Dossiê: os mesmos agregados que alimentam o relatório executivo.
+   *
+   * Existe para que o Dashboard mostre exatamente os números do .md — se a aba
+   * e o arquivo divergissem, o cliente perderia a confiança nos dois. Aqui não
+   * há IA nem custo de token: é SQL puro, o mesmo `montarDossie()`.
+   */
+  if (rota === '/dossie' && req.method === 'GET') {
+    const g = grupoId(); await exigirAcesso(usuario, g);
+    const dias = Math.min(365, Math.max(1, num(q.get('dias'), 30)));
+    return await montarDossie(db, g, 'geral', dias);
   }
 
   // ---- feed de inteligência ----------------------------------------------

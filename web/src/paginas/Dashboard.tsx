@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import {
   Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { api, type Estatisticas } from '../lib/api.ts';
+import { api, type Dossie, type Estatisticas } from '../lib/api.ts';
+import PainelExecutivo from '../componentes/PainelExecutivo.tsx';
 import { Aviso, Card, Carregando, Kpi, Titulo } from '../componentes/ui.tsx';
 
 const FULOR = '#CEFF00';
@@ -26,6 +27,8 @@ export default function Dashboard({ grupo }: { grupo: number }) {
   const [erro, setErro] = useState('');
   const [termo, setTermo] = useState('');
   const [mencoes, setMencoes] = useState<{ mensagens: number; ocorrencias: number } | null>(null);
+  const [dossie, setDossie] = useState<Dossie | null>(null);
+  const [dias, setDias] = useState(30);
 
   useEffect(() => {
     setDados(null);
@@ -33,6 +36,13 @@ export default function Dashboard({ grupo }: { grupo: number }) {
     setMencoes(null);
     api.estatisticas(grupo).then(setDados).catch((e) => setErro((e as Error).message));
   }, [grupo]);
+
+  // O dossie tem periodo proprio e recarrega sozinho: trocar a janela nao deve
+  // derrubar os graficos do historico inteiro que ja estao na tela.
+  useEffect(() => {
+    setDossie(null);
+    api.dossie(grupo, dias).then(setDossie).catch(() => setDossie(null));
+  }, [grupo, dias]);
 
   if (erro) return <Aviso tipo="erro">{erro}</Aviso>;
   if (!dados) return <Carregando />;
@@ -103,6 +113,35 @@ export default function Dashboard({ grupo }: { grupo: number }) {
           </ResponsiveContainer>
         </Card>
       </div>
+
+      {/* Bloco executivo: os mesmos agregados do relatorio .md, so que ao vivo.
+          Fica depois dos graficos gerais porque responde a outra pergunta —
+          nao "quanto se fala", e sim "como e quem". */}
+      <div className="flex flex-wrap items-baseline justify-between gap-3 border-t border-border pt-6">
+        <div>
+          <h2 className="font-display text-lg font-bold uppercase tracking-wide">Visão executiva</h2>
+          <p className="text-sm text-muted-foreground">
+            Os mesmos números do relatório executivo — apurados em SQL, sem IA.
+          </p>
+        </div>
+        <div className="flex gap-1 rounded-lg border border-border bg-white/5 p-1">
+          {[7, 30, 90].map((n) => (
+            <button
+              key={n}
+              onClick={() => setDias(n)}
+              className={`rounded px-3 py-1 text-xs font-medium transition ${
+                dias === n ? 'bg-primary text-primary-foreground'
+                           : 'text-muted-foreground hover:text-foreground'}`}
+            >
+              {n} dias
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {dossie
+        ? <PainelExecutivo dossie={dossie} />
+        : <Carregando texto="apurando o período…" />}
 
       <Card>
         <Titulo sub="Contagem exata em SQL — não usa IA nem gasta tokens.">

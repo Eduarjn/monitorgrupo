@@ -56,6 +56,29 @@ export interface Estatisticas {
   pico: Array<{ hora: number; mensagens: number }>;
   ranking: Array<{ nome: string; mensagens: number }>;
 }
+/**
+ * Dossiê: os agregados que o relatório executivo usa.
+ *
+ * Mesma origem de dados do .md gerado na aba Consultas — se a tela e o arquivo
+ * divergissem, o cliente deixaria de acreditar nos dois.
+ */
+export interface Dossie {
+  grupo: string;
+  periodo: { inicio: string; fim: string; dias: number };
+  totais: {
+    mensagens: number; participantes: number;
+    dias_com_atividade: number; media_por_dia: number;
+  };
+  por_tipo: Array<{ tipo: string; total: number }>;
+  por_origem: Array<{ origem: string; total: number }>;
+  por_participante: Array<{ nome: string; mensagens: number; participacao_pct: number }>;
+  por_hora: Array<{ hora: string; mensagens: number }>;
+  por_dia: Array<{ dia: string; mensagens: number }>;
+  alertas: Array<{ tipo: string; severidade: number; titulo: string; estado: string; criado_em: string }>;
+  temas_ia: Array<{ resumo: string; temperatura: number; sentimento: string }>;
+  tempo_sem_atividade_h: number | null;
+}
+
 export interface ResultadoUpload {
   duplicado: boolean; upload_id: number; enviado_em?: string;
   plataforma?: string; formato_data?: string; data_ambigua?: boolean;
@@ -178,6 +201,9 @@ export const api = {
 
   estatisticas: (grupo: number, inicio?: string, fim?: string) =>
     req<Estatisticas>('/stats/resumo' + qs({ grupo_id: grupo, inicio, fim })),
+
+  dossie: (grupo: number, dias = 30) =>
+    req<Dossie>('/dossie' + qs({ grupo_id: grupo, dias })),
 
   mencoes: (grupo: number, termo: string) =>
     req<{ termo: string; mensagens: number; ocorrencias: number }>(
