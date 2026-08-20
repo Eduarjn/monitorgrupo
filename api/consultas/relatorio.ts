@@ -195,6 +195,89 @@ export interface RelatorioGerado {
   dossie: Dossie;
   numeros_suspeitos: string[];
   vazio: boolean;
+  /** true = veio do cache, nenhuma chamada de modelo foi paga. */
+  doCache: boolean;
+}
+
+/**
+ * Chave do cache do relatório.
+ *
+ * Inclui o total de mensagens e a última atividade: chegou mensagem nova, a
+ * chave muda e o relatório é refeito. Nada mudou, reaproveita. Inclui também
+ * nicho e janela, porque a leitura do modelo depende dos dois.
+ *
+ * Não é hash criptográfico de propósito — é chave de cache, não segredo.
+ */
+function chaveRelatorio(d: Dossie, dias: number): string {
+  return [d.nicho, dias, d.totais.mensagens, d.totais.participantes,
+          d.tempo_sem_atividade_h ?? 'x', d.alertas.length].join('|');
+}
+
+async function lerCache(db: DB, grupoId: number, chave: string): Promise<Narrativa | null> {
+  try {
+    const { rows } = await db.query<{ narrativa: Narrativa }>(
+      `select narrativa from relatorio_cache
+        where grupo_id = $1 and chave = $2 and criado_em > now() - interval '7 days'`,
+      [grupoId, chave]);
+    return rows[0]?.narrativa ?? null;
+  } catch {
+    // Cache indisponível nunca pode derrubar o relatório — só encarece.
+    return null;
+  }
+}
+
+async function gravarCache(db: DB, grupoId: number, chave: string, n: Narrativa): Promise<void> {
+  try {
+    await db.query(
+      `insert into relatorio_cache (grupo_id, chave, narrativa) values ($1, $2, $3)
+         on conflict (grupo_id, chave) do update
+            set narrativa = excluded.narrativa, criado_em = now()`,
+      [grupoId, chave, JSON.stringify(n)]);
+  } catch { /* idem: falhar em gravar cache não é falha do relatório */ }
+}
+
+/**
+ * Versão enxuta do dossiê, só para o prompt.
+ *
+ * O dossiê completo carrega até 90 entradas de `por_dia`, as 24 de `por_hora`,
+ * 15 alertas com data e estado, e 10 temas inteiros. Nada disso muda a
+ * interpretação — o modelo só precisa saber a forma dos dados, não a série
+ * ponto a ponto. Mandar tudo era pagar token por informação que o próprio
+ * código já vai escrever no Markdown.
+ *
+ * Também sai o `JSON.stringify(…, null, 2)`: a indentação é pura decoração e
+ * custa token igual.
+ */
+export function resumirParaIA(d: Dossie): Record<string, unknown> {
+  const pico = d.por_hora.length
+    ? d.por_hora.reduce((a, b) => (b.mensagens > a.mensagens ? b : a)) : null;
+
+  // Tendência em vez da série: primeira metade contra a segunda diz ao modelo
+  // se o grupo está esquentando ou esfriando, que é tudo que ele faz com isso.
+  const meio = Math.floor(d.por_dia.length / 2);
+  const soma = (xs: typeof d.por_dia) => xs.reduce((s, x) => s + x.mensagens, 0);
+  const tendencia = d.por_dia.length >= 4
+    ? { primeira_metade: soma(d.por_dia.slice(0, meio)), segunda_metade: soma(d.por_dia.slice(meio)) }
+    : null;
+
+  return {
+    grupo: d.grupo,
+    nicho: d.nicho,
+    periodo: d.periodo,
+    totais: d.totais,
+    por_tipo: d.por_tipo,
+    // Cauda longa de participante não muda a leitura; o topo, sim.
+    participantes_topo: d.por_participante.slice(0, 6),
+    hora_de_pico: pico,
+    tendencia,
+    horas_sem_atividade: d.tempo_sem_atividade_h,
+    alertas_da_plataforma: d.alertas.slice(0, 5).map((a) => ({
+      tipo: a.tipo, severidade: a.severidade, titulo: a.titulo,
+    })),
+    temas_observados: d.temas_ia.slice(0, 5).map((t) => ({
+      resumo: t.resumo.slice(0, 200), temperatura: t.temperatura, sentimento: t.sentimento,
+    })),
+  };
 }
 
 export async function gerarRelatorio(
@@ -210,15 +293,25 @@ export async function gerarRelatorio(
                 'Não há base para análise no período.',
         alertas: [], recomendacoes: [],
       }),
-      dossie, numeros_suspeitos: [], vazio: true,
+      dossie, numeros_suspeitos: [], vazio: true, doCache: false,
     };
   }
 
+  // Cache: o relatorio so muda quando chega mensagem nova. Reabrir o mesmo card
+  // tres vezes na reuniao nao pode custar tres chamadas de modelo.
+  const chave = chaveRelatorio(dossie, dias);
+  const guardado = await lerCache(db, grupoId, chave);
+  if (guardado) {
+    return { markdown: montarMarkdown(dossie, guardado), dossie,
+             numeros_suspeitos: [], vazio: false, doCache: true };
+  }
+
   const bruto = await provider.summarize(
-    'DOSSIÊ (todos os números já apurados pelo banco):\n\n' + JSON.stringify(dossie, null, 2),
+    'DOSSIÊ (números já apurados pelo banco):\n' + JSON.stringify(resumirParaIA(dossie)),
     PROMPT_RELATORIO,
   );
   const narrativa = interpretarNarrativa(bruto);
+  await gravarCache(db, grupoId, chave, narrativa);
   const markdown = montarMarkdown(dossie, narrativa);
 
   // A conferencia continua, mas agora e cinto e suspensorio: os numeros do

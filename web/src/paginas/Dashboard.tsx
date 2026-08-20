@@ -47,7 +47,15 @@ export default function Dashboard({ grupo }: { grupo: number }) {
   if (erro) return <Aviso tipo="erro">{erro}</Aviso>;
   if (!dados) return <Carregando />;
   if (!dados.total) {
-    return <Aviso>Nenhuma mensagem neste grupo ainda. Envie um export na aba <b>Upload</b>.</Aviso>;
+    // Havia so o caminho do upload aqui; a captura em tempo real chegou depois
+    // e a mensagem ficou para tras, mandando o usuario para o lugar errado.
+    return (
+      <Aviso>
+        Nenhuma mensagem neste grupo ainda. Há dois caminhos: conectar o WhatsApp na aba{' '}
+        <b>Coleta</b> para capturar em tempo real, ou enviar o arquivo de export na aba{' '}
+        <b>Upload</b> para trazer o histórico.
+      </Aviso>
+    );
   }
 
   const contarMencoes = async (e: React.FormEvent) => {

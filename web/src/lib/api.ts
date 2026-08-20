@@ -46,9 +46,24 @@ export interface Usuario {
 }
 export interface Grupo {
   id: number; nome: string; descricao: string | null;
+  /** Segmento do cliente. Define quais cards aparecem. null = so os genericos. */
+  nicho: Nicho | null;
   frequencia_coleta: string; ultima_coleta_em: string | null;
   papel: string; mensagens: number;
 }
+
+export type Nicho = 'provedor' | 'imobiliaria' | 'condominio'
+                  | 'distribuidora' | 'atendimento' | 'comercial';
+
+/** Rotulo legivel de cada nicho. O valor do banco e tecnico; isto e o que o usuario le. */
+export const NICHOS: Array<{ valor: Nicho; rotulo: string; exemplo: string }> = [
+  { valor: 'provedor',      rotulo: 'Provedor de internet', exemplo: 'risco de cancelamento, reclamacao tecnica' },
+  { valor: 'imobiliaria',   rotulo: 'Imobiliaria',          exemplo: 'lead sem dono, objecao que travou' },
+  { valor: 'condominio',    rotulo: 'Condominio',           exemplo: 'conflito escalando, exposicao de morador' },
+  { valor: 'distribuidora', rotulo: 'Distribuidora',        exemplo: 'pedido combinado, desconto concedido' },
+  { valor: 'atendimento',   rotulo: 'Atendimento ao cliente', exemplo: 'sem resposta, assunto que repete' },
+  { valor: 'comercial',     rotulo: 'Comercial / vendas',   exemplo: 'negocio em aberto, compromisso assumido' },
+];
 export interface Estatisticas {
   total: number;
   autores: Array<{ nome: string; mensagens: number }>;
@@ -110,6 +125,7 @@ export type VisualConsulta = 'auto' | 'numero' | 'barra' | 'linha' | 'pizza' | '
 export interface Consulta {
   id: number;
   grupo_id: number | null;      // null = card global, vale em todos os grupos
+  nicho: Nicho | null;          // null = card serve a qualquer segmento
   titulo: string;
   descricao: string | null;
   natureza: NaturezaConsulta;
@@ -201,6 +217,11 @@ export const api = {
 
   estatisticas: (grupo: number, inicio?: string, fim?: string) =>
     req<Estatisticas>('/stats/resumo' + qs({ grupo_id: grupo, inicio, fim })),
+
+  definirNicho: (grupo: number, nicho: Nicho | null) =>
+    req<{ ok: true; nicho: Nicho | null }>('/grupos/nicho', {
+      method: 'POST', body: JSON.stringify({ grupo_id: grupo, nicho }),
+    }),
 
   dossie: (grupo: number, dias = 30) =>
     req<Dossie>('/dossie' + qs({ grupo_id: grupo, dias })),

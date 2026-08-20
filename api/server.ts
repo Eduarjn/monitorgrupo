@@ -147,6 +147,14 @@ function usuarioDaRequisicao(req: Req): UsuarioSessao {
 }
 
 /** A checagem que substitui o RLS nas rotas do backend. */
+/**
+ * Segmentos atendidos. Vocabulario fechado, espelhando o CHECK do banco —
+ * nicho digitado livre viraria "provedor", "Provedor", "provedor de internet",
+ * e nenhum card casaria.
+ */
+const NICHOS = ['provedor', 'imobiliaria', 'condominio',
+                'distribuidora', 'atendimento', 'comercial'];
+
 async function exigirAcesso(usuario: UsuarioSessao, grupoId: number, gerir = false) {
   const { rows } = await db.query<{ papel: string }>(
     `select papel from grupo_acessos where grupo_id = $1 and user_id = $2`,
@@ -435,7 +443,8 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     const { rows } = await db.query(
       // ::int — o driver devolve bigint como string; sem o cast, trocar de
       // grupo no seletor (que converte para número) não casa com nada.
-      `select g.id::int as id, g.nome, g.descricao, g.frequencia_coleta, g.ultima_coleta_em, a.papel,
+      `select g.id::int as id, g.nome, g.descricao, g.nicho, g.frequencia_coleta,
+              g.ultima_coleta_em, a.papel,
               (select count(*) from mensagens m where m.grupo_id = g.id)::int as mensagens
          from grupos g
          join grupo_acessos a on a.grupo_id = g.id and a.user_id = $1
@@ -1065,17 +1074,24 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
   }
 
   // ---- consultas salvas: os cards de um clique ---------------------------
-  const COLUNAS_CONSULTA = `id::int as id, grupo_id::int as grupo_id, titulo, descricao,
+  const COLUNAS_CONSULTA = `id::int as id, grupo_id::int as grupo_id, nicho, titulo, descricao,
     natureza, metrica, parametro, pergunta, visual, dias, icone, ordem, ativa,
     execucoes, ultimo_uso_em`;
 
   if (rota === '/consultas' && req.method === 'GET') {
     const g = grupoId(); await exigirAcesso(usuario, g);
-    // grupo_id nulo = card global, vale para todos os grupos.
+    // Duas dimensoes de visibilidade, independentes:
+    //   grupo_id null = card global; senao, so naquele grupo.
+    //   nicho    null = serve a qualquer segmento; senao, so no nicho do grupo.
+    // Grupo sem nicho definido ve apenas os cards genericos — melhor que
+    // despejar as perguntas de provedor num grupo de condominio.
     const { rows } = await db.query(
-      `select ${COLUNAS_CONSULTA} from consultas
-        where ativa and (grupo_id is null or grupo_id = $1)
-        order by ordem, id`, [g]);
+      `select ${COLUNAS_CONSULTA} from consultas c
+        where c.ativa
+          and (c.grupo_id is null or c.grupo_id = $1)
+          and (c.nicho is null
+               or c.nicho = (select nicho from grupos where id = $1))
+        order by c.nicho nulls first, c.ordem, c.id`, [g]);
     return { consultas: rows };
   }
 
@@ -1173,6 +1189,19 @@ async function rotear(req: Req, res: Res, url: URL): Promise<unknown> {
     const g = grupoId(); await exigirAcesso(usuario, g);
     const dias = Math.min(365, Math.max(1, num(q.get('dias'), 30)));
     return await montarDossie(db, g, 'geral', dias);
+  }
+
+  /** Define o segmento do grupo — e com ele o conjunto de cards que aparece. */
+  if (rota === '/grupos/nicho' && req.method === 'POST') {
+    const corpo = JSON.parse((await lerCorpo(req, 1)).toString() || '{}');
+    const g = num(String(corpo.grupo_id));
+    await exigirAcesso(usuario, g, true);
+    const nicho = corpo.nicho === null || corpo.nicho === '' ? null : String(corpo.nicho);
+    if (nicho !== null && !NICHOS.includes(nicho)) {
+      throw new ErroHttp(400, `Nicho inválido. Use um de: ${NICHOS.join(', ')}.`);
+    }
+    await db.query(`update grupos set nicho = $2 where id = $1`, [g, nicho]);
+    return { ok: true, nicho };
   }
 
   // ---- feed de inteligência ----------------------------------------------

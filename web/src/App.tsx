@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   BarChart3, LayoutGrid, LogOut, MessageSquareText, Plug, Search, ShieldCheck, UploadCloud,
 } from 'lucide-react';
@@ -31,7 +31,9 @@ export default function App() {
   const [aba, setAba] = useState<Aba>('dashboard');
   const [erro, setErro] = useState('');
 
-  useEffect(() => {
+  // Extraida do efeito porque o seletor de nicho tambem precisa recarregar:
+  // o nicho mora no grupo, entao troca-lo invalida esta lista.
+  const carregarGrupos = useCallback(() => {
     if (!usuario) return;
     api.grupos()
       .then((r) => {
@@ -40,6 +42,8 @@ export default function App() {
       })
       .catch((e) => setErro((e as Error).message));
   }, [usuario]);
+
+  useEffect(() => { carregarGrupos(); }, [carregarGrupos]);
 
   if (carregando) return <Carregando texto="verificando sessão…" />;
   if (!usuario) return <Login />;
@@ -133,7 +137,8 @@ export default function App() {
           <>
             {aba === 'dashboard' && <Dashboard grupo={grupo.id} />}
             {aba === 'consultas' && (
-              <Consultas grupo={grupo.id} grupoNome={grupo.nome} podeGerir={podeGerir} />
+              <Consultas grupo={grupo.id} grupoNome={grupo.nome} podeGerir={podeGerir}
+                         nicho={grupo.nicho} aoMudarNicho={carregarGrupos} />
             )}
             {aba === 'analise' && <Analise grupo={grupo.id} grupoNome={grupo.nome} />}
             {aba === 'upload' && <Upload grupo={grupo.id} />}

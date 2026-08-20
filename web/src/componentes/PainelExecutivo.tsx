@@ -73,6 +73,29 @@ function Rosca({ titulo, sub, dados }: {
 export default function PainelExecutivo({ dossie }: { dossie: Dossie }) {
   const d = dossie;
 
+  // O grupo pode ter historico e mesmo assim nada na janela escolhida. Mostrar
+  // cinco graficos vazios faz parecer defeito; dizer que a janela esta vazia e
+  // sugerir uma maior resolve em uma linha.
+  if (d.totais.mensagens === 0) {
+    return (
+      <Card>
+        <Titulo sub={`Nenhuma mensagem entre ${d.periodo.inicio} e ${d.periodo.fim}.`}>
+          Sem movimento no período
+        </Titulo>
+        <p className="text-sm text-muted-foreground">
+          {d.tempo_sem_atividade_h == null
+            ? 'Este grupo nunca recebeu mensagem.'
+            : <>A última mensagem do grupo foi há{' '}
+                <b className="text-foreground">
+                  {d.tempo_sem_atividade_h >= 48
+                    ? `${Math.round(d.tempo_sem_atividade_h / 24)} dias`
+                    : `${d.tempo_sem_atividade_h} horas`}
+                </b>. Aumente a janela acima para alcançá-la.</>}
+        </p>
+      </Card>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div className="grid gap-6 lg:grid-cols-2">

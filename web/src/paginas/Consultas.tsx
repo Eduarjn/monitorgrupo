@@ -6,7 +6,8 @@ import {
 import {
   Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { api, type Consulta, type ResultadoConsulta } from '../lib/api.ts';
+import SeletorNicho from '../componentes/SeletorNicho.tsx';
+import { api, type Consulta, type Nicho, type ResultadoConsulta } from '../lib/api.ts';
 import { Aviso, Botao, Card, Carregando, Titulo } from '../componentes/ui.tsx';
 
 /**
@@ -157,8 +158,11 @@ function Grafico({ v }: { v: NonNullable<ResultadoConsulta['visual']> }) {
   );
 }
 
-export default function Consultas({ grupo, grupoNome, podeGerir }: {
+export default function Consultas({ grupo, grupoNome, podeGerir, nicho, aoMudarNicho }: {
   grupo: number; grupoNome?: string; podeGerir: boolean;
+  nicho: Nicho | null;
+  /** Recarrega os grupos no App — o nicho vive la, nao aqui. */
+  aoMudarNicho: () => void;
 }) {
   const [cards, setCards] = useState<Consulta[] | null>(null);
   const [resultado, setResultado] = useState<ResultadoConsulta | null>(null);
@@ -193,6 +197,15 @@ export default function Consultas({ grupo, grupoNome, podeGerir }: {
   return (
     <div className="space-y-6">
       {erro && <Aviso tipo="erro">{erro}</Aviso>}
+
+      {/* Fica ANTES dos cards de proposito: e o controle que decide quais cards
+          existem, entao ler de cima para baixo faz sentido. */}
+      <SeletorNicho
+        grupo={grupo}
+        nicho={nicho}
+        podeGerir={podeGerir}
+        aoMudar={() => { aoMudarNicho(); carregar(); }}
+      />
 
       <Card>
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
